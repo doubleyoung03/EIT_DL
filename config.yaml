@@ -1,0 +1,31 @@
+# ──────────────────────────────────────────────────────────────────
+# EIT Reconstruction Baseline – Configuration
+# ──────────────────────────────────────────────────────────────────
+
+# ── Physics / geometry ────────────────────────────────────────────
+input_dim:        224       # 16 drives × 14 measures  (32 self-excluded)
+image_size:       32        # output grid is 32×32 pixels
+tank_radius_mm:   50.0      # circular tank radius [mm]
+n_electrodes:     16        # equally spaced on tank boundary
+n_harmonics:      50        # Fourier-series truncation (converges for r < R)
+
+# ── Synthetic-data generation ─────────────────────────────────────
+n_train:               10000
+n_val:                  2000
+n_test:                  500
+anomaly_min_radius_mm:   5.0   # smallest anomaly radius [mm]
+anomaly_max_radius_mm:  20.0   # largest  anomaly radius [mm]
+noise_std:              0.02   # proportional Gaussian noise on ΔV
+
+# ── Training ──────────────────────────────────────────────────────
+batch_size:    64
+lr:            1.0e-3
+weight_decay:  1.0e-4
+epochs:        100
+patience:      15            # early-stopping patience (val-loss epochs)
+
+# ── Paths ─────────────────────────────────────────────────────────
+data_dir:        data
+results_dir:     results
+checkpoint_dir:  checkpoints
+best_model_name: best_model.pth
