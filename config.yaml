@@ -1,5 +1,5 @@
 # ──────────────────────────────────────────────────────────────────
-# EIT Reconstruction Baseline – Configurations
+# EIT Reconstruction Baseline – Configuration
 # ──────────────────────────────────────────────────────────────────
 
 # ── Physics / geometry ────────────────────────────────────────────
@@ -10,7 +10,7 @@ n_electrodes:     16        # equally spaced on tank boundary
 n_harmonics:      50        # Fourier-series truncation (converges for r < R)
 
 # ── Synthetic-data generation ─────────────────────────────────────
-n_train:               1000
+n_train:               10000
 n_val:                  2000
 n_test:                  500
 anomaly_min_radius_mm:   5.0   # smallest anomaly radius [mm]
