@@ -1,31 +1,29 @@
-# ──────────────────────────────────────────────────────────────────
-# EIT Reconstruction Baseline – Configuration
-# ──────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# EIT Reconstruction – 64x64 High-Resolution Polarised Anomaly Pipeline
+# ──────────────────────────────────────────────────────────────────────────────
 
-# ── Physics / geometry ────────────────────────────────────────────
-input_dim:        224       # 16 drives × 14 measures  (32 self-excluded)
-image_size:       32        # output grid is 32×32 pixels
-tank_radius_mm:   50.0      # circular tank radius [mm]
-n_electrodes:     16        # equally spaced on tank boundary
-n_harmonics:      50        # Fourier-series truncation (converges for r < R)
+# ── Network I/O ───────────────────────────────────────────────────────────────
+input_dim:   224       # 16 drives x 14 measures  (32 self-measurements excluded)
+image_size:  64        # output grid is 64x64 pixels  (4096 output neurons)
+tank_radius: 50.0      # circular domain radius [mm]
 
-# ── Synthetic-data generation ─────────────────────────────────────
-n_train:               10000
-n_val:                  2000
-n_test:                  500
-anomaly_min_radius_mm:   5.0   # smallest anomaly radius [mm]
-anomaly_max_radius_mm:  20.0   # largest  anomaly radius [mm]
-noise_std:              0.02   # proportional Gaussian noise on ΔV
+# ── MLP architecture ──────────────────────────────────────────────────────────
+hidden_dims: [512, 1024, 2048]   # encoder widths; head = 2048 -> 4096 + Tanh
+dropout:     0.2
 
-# ── Training ──────────────────────────────────────────────────────
-batch_size:    64
-lr:            1.0e-3
-weight_decay:  1.0e-4
-epochs:        100
-patience:      15            # early-stopping patience (val-loss epochs)
+# ── Dataset  (CSV produced externally by COMSOL) ──────────────────────────────
+data_dir:     data
+csv_filename: eit_dataset.csv
 
-# ── Paths ─────────────────────────────────────────────────────────
-data_dir:        data
-results_dir:     results
+# ── Training ──────────────────────────────────────────────────────────────────
+lr:                1.0e-3
+weight_decay:      1.0e-4
+batch_size:        64
+epochs:            100
+scheduler_patience: 10         # ReduceLROnPlateau: epochs with no val improvement
+scheduler_factor:   0.5        # LR multiplier on plateau
+patience:          20          # early-stopping patience (epochs)
+
+# ── Output paths ──────────────────────────────────────────────────────────────
 checkpoint_dir:  checkpoints
-best_model_name: best_model.pth
+results_dir:     results

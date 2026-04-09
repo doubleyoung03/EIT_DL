@@ -1,13 +1,27 @@
 """
-EIT Reconstruction MLP.
+EIT Reconstruction MLP – 64x64 High-Resolution Polarised Output.
 
-Architecture (as specified):
-    Input  : (B, 224)  – normalised differential voltage ΔV
-    Hidden : 224 → 512 → 1024 → 2048  (each: Linear → BN → ReLU → Dropout)
-    Output : 2048 → 1024, reshaped to (B, 1, 32, 32) – raw logits
+Architecture
+────────────
+    Input         (B, 224)    normalised delta-V
 
-No sigmoid on the output; BCEWithLogitsLoss is applied during training.
-At inference, apply torch.sigmoid() and threshold at 0.5.
+    Encoder  [3 blocks, each = Linear -> BatchNorm1d -> ReLU -> Dropout(p)]
+        224  ->  512
+        512  ->  1024
+        1024 ->  2048
+
+    Head     [final linear + bounded activation]
+        2048 ->  4096   (= 64 * 64)
+        nn.Tanh()       bounds output to [-1, 1]
+
+    Reshape  (B, 4096) -> (B, 1, 64, 64)
+
+Output semantics
+────────────────
+    +1.0  conductive anomaly pixel
+    -1.0  resistive  anomaly pixel
+     0.0  background / outside-tank
+Trained with nn.MSELoss() against continuous targets in {-1, 0, +1}.
 """
 
 from __future__ import annotations
@@ -18,64 +32,72 @@ import torch.nn as nn
 
 class EITReconstructor(nn.Module):
     """
-    Fully-connected MLP for EIT image reconstruction.
+    Fully-connected MLP for 64x64 polarised EIT reconstruction.
 
     Parameters
     ----------
     config : dict
-        Keys consumed: input_dim (224), image_size (32).
-    dropout : float
-        Dropout probability for hidden layers. Default 0.2.
+        Required keys:
+            input_dim   : int         – 224
+            image_size  : int         – 64   (output = 64*64 = 4096 neurons)
+            hidden_dims : list[int]   – [512, 1024, 2048]
+            dropout     : float       – 0.2
     """
 
-    def __init__(self, config: dict, dropout: float = 0.2) -> None:
+    def __init__(self, config: dict) -> None:
         super().__init__()
 
-        inp     = int(config["input_dim"])    # 224
-        img_sz  = int(config["image_size"])   # 32
-        out_dim = img_sz * img_sz             # 1024
+        in_dim      = int(config["input_dim"])
+        img_sz      = int(config["image_size"])
+        hidden_dims = list(config["hidden_dims"])
+        p_drop      = float(config.get("dropout", 0.2))
+        out_dim     = img_sz * img_sz                    # 64*64 = 4096
 
         def _block(in_f: int, out_f: int) -> nn.Sequential:
+            """Standard MLP block: Linear -> BatchNorm1d -> ReLU -> Dropout."""
             return nn.Sequential(
                 nn.Linear(in_f, out_f),
                 nn.BatchNorm1d(out_f),
                 nn.ReLU(inplace=True),
-                nn.Dropout(dropout),
+                nn.Dropout(p=p_drop),
             )
 
-        # 224 → 512 → 1024 → 2048
-        self.encoder = nn.Sequential(
-            _block(inp,  512),
-            _block(512,  1024),
-            _block(1024, 2048),
-        )
+        # Encoder: build dynamically from hidden_dims list
+        dims    = [in_dim] + hidden_dims              # [224, 512, 1024, 2048]
+        encoder = [_block(dims[i], dims[i + 1]) for i in range(len(dims) - 1)]
+        self.encoder = nn.Sequential(*encoder)
 
-        # 2048 → 1024 (logits, no activation)
-        self.head = nn.Linear(2048, out_dim)
+        # Head: 2048 -> 4096, bounded to [-1, 1] by Tanh
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dims[-1], out_dim),
+            nn.Tanh(),
+        )
 
         self.img_sz = img_sz
         self._init_weights()
 
+    # ── Weight initialisation ─────────────────────────────────────────────────
+
     def _init_weights(self) -> None:
-        """Kaiming-uniform init for linear layers; BatchNorm defaults are fine."""
+        """Kaiming-uniform init for all Linear layers."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_uniform_(m.weight, nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+    # ── Forward pass ──────────────────────────────────────────────────────────
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
-        x : torch.Tensor, shape (B, 224)
-            Normalised differential voltages.
+        x : Tensor  (B, 224)  – normalised differential voltages.
 
         Returns
         -------
-        logits : torch.Tensor, shape (B, 1, 32, 32)
-            Raw logits; apply sigmoid + threshold 0.5 for binary mask.
+        Tensor  (B, 1, 64, 64)  – pixel predictions in [-1, 1].
         """
-        h      = self.encoder(x)                              # (B, 2048)
-        logits = self.head(h)                                 # (B, 1024)
-        return logits.reshape(-1, 1, self.img_sz, self.img_sz)  # (B, 1, 32, 32)
+        h   = self.encoder(x)                              # (B, 2048)
+        out = self.head(h)                                 # (B, 4096)
+        return out.reshape(-1, 1, self.img_sz, self.img_sz)  # (B, 1, 64, 64)
