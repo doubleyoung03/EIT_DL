@@ -1,5 +1,15 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+# PyTorch with CUDA: install separately via conda or the pip CUDA index
+# (see README / setup instructions)
+torch>=2.1
 numpy>=1.24
-torch>=2.0
+pandas>=2.0
+
+# ── ML utilities ──────────────────────────────────────────────────────────────
+scikit-learn>=1.3
+scipy>=1.11
+
+# ── Visualisation / config ────────────────────────────────────────────────────
 matplotlib>=3.7
 pyyaml>=6.0
 tqdm>=4.65
