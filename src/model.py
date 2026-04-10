@@ -5,12 +5,12 @@ All variants map:
     input  : (B, input_dim=224)
     output : (B, 1, image_size, image_size), bounded to [-1, 1] by Tanh.
 
-Supported model_name values:
-    - "res_mlp_large"
-    - "cnn_decoder_large"
-    - "bilstm_decoder_large"
-    - "transformer_decoder_large"
-    - "mlp" (legacy baseline)
+Supported model_name values (or compatible aliases):
+    - "mlp", "mlp_large", "mlp_xlarge"
+    - "res_mlp_large", "res_mlp_xlarge"
+    - "cnn_decoder_large", "cnn_decoder_xlarge"
+    - "bilstm_decoder_large", "bilstm_decoder_xlarge"
+    - "transformer_decoder_large", "transformer_decoder_xlarge"
 """
 
 from __future__ import annotations
@@ -321,20 +321,20 @@ class EITReconstructor(nn.Module):
         model_name = str(config.get("model_name", "mlp")).lower()
         model_cfg = dict(config.get("model") or {})
 
-        if model_name == "mlp":
+        if model_name in {"mlp", "mlp_large", "mlp_xlarge"}:
             # Backward compatible path.
             if "hidden_dims" not in model_cfg and "hidden_dims" in config:
                 model_cfg["hidden_dims"] = config["hidden_dims"]
             if "dropout" not in model_cfg and "dropout" in config:
                 model_cfg["dropout"] = config["dropout"]
             self.net = LegacyMLPReconstructor(input_dim, image_size, model_cfg)
-        elif model_name == "res_mlp_large":
+        elif model_name.startswith("res_mlp"):
             self.net = ResMLPReconstructor(input_dim, image_size, model_cfg)
-        elif model_name == "cnn_decoder_large":
+        elif model_name.startswith("cnn_decoder"):
             self.net = CNNDecoderReconstructor(input_dim, image_size, model_cfg)
-        elif model_name == "bilstm_decoder_large":
+        elif model_name.startswith("bilstm_decoder"):
             self.net = BiLSTMDecoderReconstructor(input_dim, image_size, model_cfg)
-        elif model_name == "transformer_decoder_large":
+        elif model_name.startswith("transformer_decoder"):
             self.net = TransformerDecoderReconstructor(input_dim, image_size, model_cfg)
         else:
             raise ValueError(f"Unknown model_name: {model_name}")

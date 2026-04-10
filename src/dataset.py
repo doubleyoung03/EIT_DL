@@ -37,6 +37,7 @@ StandardScaler is fitted EXCLUSIVELY on the training indices.
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 import numpy as np
@@ -66,6 +67,20 @@ def _build_valid_mask(n_el: int = 16) -> np.ndarray:
 
 
 _VALID_MASK = _build_valid_mask(16)   # (256,) bool, module-level cache
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DataLoader seed helper
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _seed_worker(worker_id: int) -> None:
+    """
+    Keep numpy/python RNG deterministic per worker.
+    Useful when num_workers > 0.
+    """
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -252,10 +267,41 @@ def get_dataloaders(
 
     bs  = int(config["batch_size"])
     pin = torch.cuda.is_available()
+    num_workers = int(config.get("num_workers", 0))
+    seed = config.get("seed", None)
+
+    train_gen = None
+    if seed is not None:
+        train_gen = torch.Generator()
+        train_gen.manual_seed(int(seed))
+
+    worker_init = _seed_worker if num_workers > 0 else None
 
     return (
-        DataLoader(train_ds, batch_size=bs, shuffle=True,  num_workers=0, pin_memory=pin),
-        DataLoader(val_ds,   batch_size=bs, shuffle=False, num_workers=0, pin_memory=pin),
-        DataLoader(test_ds,  batch_size=bs, shuffle=False, num_workers=0, pin_memory=pin),
+        DataLoader(
+            train_ds,
+            batch_size=bs,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin,
+            generator=train_gen,
+            worker_init_fn=worker_init,
+        ),
+        DataLoader(
+            val_ds,
+            batch_size=bs,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin,
+            worker_init_fn=worker_init,
+        ),
+        DataLoader(
+            test_ds,
+            batch_size=bs,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin,
+            worker_init_fn=worker_init,
+        ),
         test_ds,
     )

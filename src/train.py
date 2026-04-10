@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +30,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import yaml
@@ -36,6 +39,27 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from dataset import get_dataloaders
 from model import EITReconstructor
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+def seed_everything(seed: int, deterministic: bool = False) -> None:
+    """
+    Seed python/numpy/torch RNG for reproducible runs.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        # Helps deterministic behavior for CUDA matmul kernels.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -129,6 +153,13 @@ def main() -> None:
     args = parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    seed = cfg.get("seed", None)
+    deterministic = bool(cfg.get("deterministic", False))
+    if seed is not None:
+        seed_everything(int(seed), deterministic=deterministic)
+        print(f"[train] seed          = {int(seed)}")
+        print(f"[train] deterministic = {deterministic}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[train] device        = {device}")

@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -182,6 +183,20 @@ def parse_args() -> argparse.Namespace:
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
+def seed_everything(seed: int, deterministic: bool = False) -> None:
+    """Seed python/numpy/torch RNG for reproducible test sampling."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+
 def _safe_float(v: float | int | np.floating | None) -> float | None:
     if v is None:
         return None
@@ -210,6 +225,12 @@ def main() -> None:
     args = parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    deterministic = bool(cfg.get("deterministic", False))
+    seed_for_test = args.seed if args.seed is not None else cfg.get("test_seed", cfg.get("seed", None))
+    if seed_for_test is not None:
+        seed_for_test = int(seed_for_test)
+        seed_everything(seed_for_test, deterministic=deterministic)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     R      = float(cfg["tank_radius"])
@@ -262,11 +283,11 @@ def main() -> None:
     n = min(int(requested_n), len(test_ds))
     if n <= 0:
         raise ValueError("n-samples must be >= 1.")
-    rng  = np.random.default_rng(args.seed)
-    if args.seed is None:
+    rng  = np.random.default_rng(seed_for_test)
+    if seed_for_test is None:
         print("[test] Sample selection: random (no fixed seed)")
     else:
-        print(f"[test] Sample selection seed: {args.seed}")
+        print(f"[test] Sample selection seed: {seed_for_test}")
     idxs = rng.choice(len(test_ds), size=n, replace=False)
 
     # ── High-resolution grid for smoother display/localisation ────────────────
@@ -371,6 +392,7 @@ def main() -> None:
         "lr": cfg.get("lr"),
         "weight_decay": cfg.get("weight_decay"),
         "batch_size": cfg.get("batch_size"),
+        "num_workers": cfg.get("num_workers"),
         "epochs": cfg.get("epochs"),
         "scheduler_patience": cfg.get("scheduler_patience"),
         "scheduler_factor": cfg.get("scheduler_factor"),
@@ -378,6 +400,9 @@ def main() -> None:
         "min_delta": cfg.get("min_delta"),
         "input_noise_std": cfg.get("input_noise_std"),
         "max_grad_norm": cfg.get("max_grad_norm"),
+        "seed": cfg.get("seed"),
+        "test_seed": cfg.get("test_seed"),
+        "deterministic": cfg.get("deterministic"),
         "vis_gaussian_sigma": cfg.get("vis_gaussian_sigma"),
         "vis_class_threshold": cfg.get("vis_class_threshold"),
         "vis_upsample": cfg.get("vis_upsample"),
@@ -393,7 +418,7 @@ def main() -> None:
         "loss_curve_file": loss_curve_name,
         "reconstruction_file": out_path.name,
         "n_samples": int(n),
-        "seed": args.seed,
+        "seed": seed_for_test,
         "sample_indices": [int(i) for i in idxs.tolist()],
         "metrics": {
             "test_mse": float(test_mse),

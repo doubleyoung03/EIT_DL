@@ -8,6 +8,13 @@ image_size: 64         # output = 64x64
 tank_radius: 50.0      # tank radius [mm]
 
 # ── Active model (switch here) ───────────────────────────────────────────────
+# Supported model_name:
+#   mlp / mlp_large / mlp_xlarge
+#   res_mlp_large / res_mlp_xlarge
+#   cnn_decoder_large / cnn_decoder_xlarge
+#   bilstm_decoder_large / bilstm_decoder_xlarge
+#   transformer_decoder_large / transformer_decoder_xlarge
+
 model_name: transformer_decoder_large
 model:
   token_dim: 128
@@ -20,7 +27,41 @@ model:
   decoder_channels: [256, 128, 64, 32]   # len must be log2(image_size/latent_hw)+1
   decoder_dropout: 0.10
 
-# Model template: CNN decoder (MLP encoder + ConvTranspose decoder)
+# Model template: pure MLP baseline
+# model_name: mlp
+# model:
+#   hidden_dims: [512, 1024, 2048]
+#   dropout: 0.20
+
+# Model template: pure MLP large
+# model_name: mlp_large
+# model:
+#   hidden_dims: [1024, 2048, 4096]
+#   dropout: 0.25
+
+# Model template: pure MLP xlarge
+# model_name: mlp_xlarge
+# model:
+#   hidden_dims: [1024, 2048, 4096, 4096, 2048]
+#   dropout: 0.30
+
+# Model template: residual MLP large (strong baseline)
+# model_name: res_mlp_large
+# model:
+#   hidden_dim: 2048
+#   num_blocks: 8
+#   mlp_ratio: 2.0
+#   dropout: 0.25
+
+# Model template: residual MLP xlarge
+# model_name: res_mlp_xlarge
+# model:
+#   hidden_dim: 3072
+#   num_blocks: 12
+#   mlp_ratio: 2.5
+#   dropout: 0.30
+
+# Model template: CNN decoder large (MLP encoder + ConvTranspose decoder)
 # model_name: cnn_decoder_large
 # model:
 #   encoder_dims: [1024, 2048, 4096]
@@ -30,7 +71,17 @@ model:
 #   decoder_channels: [256, 128, 64, 32]
 #   decoder_dropout: 0.10
 
-# Model template: BiLSTM decoder
+# Model template: CNN decoder xlarge
+# model_name: cnn_decoder_xlarge
+# model:
+#   encoder_dims: [2048, 4096, 4096]
+#   dropout: 0.30
+#   latent_channels: 512
+#   latent_hw: 8
+#   decoder_channels: [512, 256, 128, 64]
+#   decoder_dropout: 0.15
+
+# Model template: BiLSTM decoder large
 # model_name: bilstm_decoder_large
 # model:
 #   embed_dim: 64
@@ -42,13 +93,30 @@ model:
 #   decoder_channels: [256, 128, 64, 32]
 #   decoder_dropout: 0.10
 
-# Model template: residual MLP (strong baseline, no convolution)
-# model_name: res_mlp_large
+# Model template: BiLSTM decoder xlarge
+# model_name: bilstm_decoder_xlarge
 # model:
-#   hidden_dim: 2048
-#   num_blocks: 8
-#   mlp_ratio: 2.0
+#   embed_dim: 128
+#   hidden_dim: 768
+#   num_layers: 3
 #   dropout: 0.25
+#   latent_channels: 512
+#   latent_hw: 8
+#   decoder_channels: [512, 256, 128, 64]
+#   decoder_dropout: 0.15
+
+# Model template: Transformer decoder xlarge
+# model_name: transformer_decoder_xlarge
+# model:
+#   token_dim: 192
+#   nhead: 8
+#   num_layers: 10
+#   ff_dim: 768
+#   dropout: 0.20
+#   latent_channels: 512
+#   latent_hw: 8
+#   decoder_channels: [512, 256, 128, 64]
+#   decoder_dropout: 0.15
 
 # ── Dataset (CSV produced externally by COMSOL) ──────────────────────────────
 data_dir: data
@@ -58,6 +126,7 @@ csv_filename: eit_dataset.csv
 lr: 1.0e-3
 weight_decay: 1.0e-4
 batch_size: 64
+num_workers: 0              # >0 can speed loading, but affects determinism setup
 epochs: 120
 scheduler_patience: 10     # ReduceLROnPlateau patience
 scheduler_factor: 0.5      # LR multiplier on plateau
@@ -65,6 +134,11 @@ patience: 25               # early stopping patience
 min_delta: 1.0e-6          # minimum val-improvement to reset patience
 input_noise_std: 0.01      # Gaussian noise on train input only
 max_grad_norm: 1.0         # 0 or negative disables gradient clipping
+
+# ── Reproducibility ───────────────────────────────────────────────────────────
+seed: 42                   # set null for fully random runs
+test_seed: 42              # seed used by test.py when --seed is not passed
+deterministic: true        # stricter reproducibility; can reduce speed
 
 # ── Visualisation (test.py) ───────────────────────────────────────────────────
 vis_gaussian_sigma: 1.0
