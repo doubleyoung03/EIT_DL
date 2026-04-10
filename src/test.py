@@ -10,7 +10,8 @@ For randomly selected test samples this script:
   3. Applies Gaussian smoothing + high-resolution rendering for cleaner edges.
   4. Hides values outside the 50 mm tank and overlays a black solid tank boundary.
   5. Computes localisation error (mm) using predicted anomaly centroid vs GT centre.
-  5. Saves to  results/final_reconstruction.png.
+  5. Saves to  results/reconstruction_<checkpoint_stem>.png.
+  6. Appends a JSONL test record to results/test_runs.jsonl.
 
 Checkpoint selection
 ────────────────────
@@ -27,8 +28,10 @@ Usage (from project root  D:\\Yang\\EIT\\Network):
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib
@@ -46,9 +49,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from dataset import build_pixel_grid, get_dataloaders
 from model import EITReconstructor
 
-_GAUSS_SIGMA = 1.0
-_CLS_THRESH = 0.1
-_UPSAMPLE = 4
+_DEFAULT_GAUSS_SIGMA = 1.0
+_DEFAULT_CLS_THRESH = 0.1
+_DEFAULT_UPSAMPLE = 4
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -166,8 +169,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model",     default=None,
                    help="Path to a specific .pth checkpoint.  "
                         "If omitted, the newest file in checkpoint_dir/ is used.")
-    p.add_argument("--n-samples", type=int, default=5,
-                   help="Number of test samples to visualise (default: 5)")
+    p.add_argument("--n-samples", type=int, default=None,
+                   help="Number of test samples to visualise. "
+                        "If omitted, uses config default_test_samples.")
     p.add_argument("--seed",      type=int, default=None,
                    help="Random seed for sample selection. "
                         "If omitted, samples are random each run.")
@@ -178,6 +182,30 @@ def parse_args() -> argparse.Namespace:
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _safe_float(v: float | int | np.floating | None) -> float | None:
+    if v is None:
+        return None
+    x = float(v)
+    if math.isnan(x) or math.isinf(x):
+        return None
+    return x
+
+
+def _resolve_log_path(cfg: dict) -> Path:
+    log_name = str(cfg.get("test_log_filename", "test_runs.jsonl"))
+    p = Path(log_name)
+    if p.is_absolute():
+        return p
+    return Path(cfg["results_dir"]) / p
+
+
+def _append_jsonl(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=True))
+        f.write("\n")
+
+
 def main() -> None:
     args = parse_args()
     with open(args.config) as f:
@@ -186,6 +214,9 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     R      = float(cfg["tank_radius"])
     img_sz = int(cfg["image_size"])
+    gauss_sigma = float(cfg.get("vis_gaussian_sigma", _DEFAULT_GAUSS_SIGMA))
+    cls_thresh = float(cfg.get("vis_class_threshold", _DEFAULT_CLS_THRESH))
+    upsample = int(cfg.get("vis_upsample", _DEFAULT_UPSAMPLE))
 
     # ── Resolve checkpoint path ────────────────────────────────────────────────
     if args.model is not None:
@@ -201,9 +232,12 @@ def main() -> None:
     model = EITReconstructor(cfg).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
+    run_stem = str(ckpt.get("run_stem", ckpt_path.stem))
+    loss_curve_name = str(ckpt.get("loss_curve_filename", f"loss_curve_{run_stem}.png"))
     print(f"[test] Loaded  epoch={ckpt.get('epoch', '?')}  "
           f"val_MSE={ckpt.get('val_mse', float('nan')):.6f}  "
-          f"ts={ckpt.get('timestamp', 'unknown')}")
+          f"ts={ckpt.get('timestamp', 'unknown')}  "
+          f"model={ckpt.get('model_name', cfg.get('model_name', 'unknown'))}")
 
     # ── Reload test split (deterministic – identical seeds to train.py) ────────
     _, _, test_loader, test_ds = get_dataloaders(cfg)
@@ -224,7 +258,10 @@ def main() -> None:
     print(f"[test] Final Test RMSE = {test_rmse:.6f}")
 
     # ── Sample selection ───────────────────────────────────────────────────────
-    n    = min(args.n_samples, len(test_ds))
+    requested_n = args.n_samples if args.n_samples is not None else int(cfg.get("default_test_samples", 5))
+    n = min(int(requested_n), len(test_ds))
+    if n <= 0:
+        raise ValueError("n-samples must be >= 1.")
     rng  = np.random.default_rng(args.seed)
     if args.seed is None:
         print("[test] Sample selection: random (no fixed seed)")
@@ -233,7 +270,7 @@ def main() -> None:
     idxs = rng.choice(len(test_ds), size=n, replace=False)
 
     # ── High-resolution grid for smoother display/localisation ────────────────
-    hi_sz = img_sz * _UPSAMPLE
+    hi_sz = img_sz * upsample
     xx_hi, yy_hi, tank_mask_hi = build_pixel_grid(hi_sz, R)
 
     # ── Batch inference ────────────────────────────────────────────────────────
@@ -263,14 +300,14 @@ def main() -> None:
         gt_hi[in_anomaly] = 1 if pol_sign > 0 else -1
 
         # Smooth prediction, upsample, then quantise to three classes.
-        pred_s = gaussian_filter(preds[row], sigma=_GAUSS_SIGMA)
-        pred_hi = zoom(pred_s, zoom=_UPSAMPLE, order=1)
-        pred_cls_hi = _to_three_class(pred_hi, thr=_CLS_THRESH)
+        pred_s = gaussian_filter(preds[row], sigma=gauss_sigma)
+        pred_hi = zoom(pred_s, zoom=upsample, order=1)
+        pred_cls_hi = _to_three_class(pred_hi, thr=cls_thresh)
 
         x_pred_mm, y_pred_mm = _centroid_mm(
             pred_hi=pred_hi,
             polarity=pol_sign,
-            thr=_CLS_THRESH,
+            thr=cls_thresh,
             xx_hi=xx_hi,
             yy_hi=yy_hi,
             tank_mask_hi=tank_mask_hi,
@@ -313,10 +350,62 @@ def main() -> None:
 
     out_dir  = Path(cfg["results_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "final_reconstruction.png"
+    out_path = out_dir / f"reconstruction_{run_stem}.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[test] Report saved -> {out_path}")
+
+    # ── Append one run record ─────────────────────────────────────────────────
+    loc_mean = float(loc_errs_mm.mean())
+    loc_median = float(np.median(loc_errs_mm))
+    loc_p90 = float(np.percentile(loc_errs_mm, 90))
+
+    cfg_snapshot = {
+        "input_dim": cfg.get("input_dim"),
+        "image_size": cfg.get("image_size"),
+        "tank_radius": cfg.get("tank_radius"),
+        "data_dir": cfg.get("data_dir"),
+        "csv_filename": cfg.get("csv_filename"),
+        "model_name": cfg.get("model_name"),
+        "model": cfg.get("model", {}),
+        "lr": cfg.get("lr"),
+        "weight_decay": cfg.get("weight_decay"),
+        "batch_size": cfg.get("batch_size"),
+        "epochs": cfg.get("epochs"),
+        "scheduler_patience": cfg.get("scheduler_patience"),
+        "scheduler_factor": cfg.get("scheduler_factor"),
+        "patience": cfg.get("patience"),
+        "min_delta": cfg.get("min_delta"),
+        "input_noise_std": cfg.get("input_noise_std"),
+        "max_grad_norm": cfg.get("max_grad_norm"),
+        "vis_gaussian_sigma": cfg.get("vis_gaussian_sigma"),
+        "vis_class_threshold": cfg.get("vis_class_threshold"),
+        "vis_upsample": cfg.get("vis_upsample"),
+    }
+    log_record = {
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "config_path": str(Path(args.config)),
+        "config": cfg_snapshot,
+        "checkpoint": str(ckpt_path),
+        "checkpoint_epoch": ckpt.get("epoch"),
+        "checkpoint_val_mse": _safe_float(ckpt.get("val_mse")),
+        "run_stem": run_stem,
+        "loss_curve_file": loss_curve_name,
+        "reconstruction_file": out_path.name,
+        "n_samples": int(n),
+        "seed": args.seed,
+        "sample_indices": [int(i) for i in idxs.tolist()],
+        "metrics": {
+            "test_mse": float(test_mse),
+            "test_rmse": float(test_rmse),
+            "loc_err_mean_mm": loc_mean,
+            "loc_err_median_mm": loc_median,
+            "loc_err_p90_mm": loc_p90,
+        },
+    }
+    log_path = _resolve_log_path(cfg)
+    _append_jsonl(log_path, log_record)
+    print(f"[test] Log appended -> {log_path}")
 
 
 if __name__ == "__main__":

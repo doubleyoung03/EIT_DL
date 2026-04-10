@@ -1,29 +1,78 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# EIT Reconstruction – 64x64 High-Resolution Polarised Anomaly Pipeline
+# EIT Reconstruction – configurable model/training/visualisation pipeline
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Network I/O ───────────────────────────────────────────────────────────────
-input_dim:   224       # 16 drives x 14 measures  (32 self-measurements excluded)
-image_size:  64        # output grid is 64x64 pixels  (4096 output neurons)
-tank_radius: 50.0      # circular domain radius [mm]
+input_dim: 224         # 16 drives x 14 measures (32 self-measurements removed)
+image_size: 64         # output = 64x64
+tank_radius: 50.0      # tank radius [mm]
 
-# ── MLP architecture ──────────────────────────────────────────────────────────
-hidden_dims: [512, 1024, 2048]   # encoder widths; head = 2048 -> 4096 + Tanh
-dropout:     0.2
+# ── Active model (switch here) ───────────────────────────────────────────────
+model_name: transformer_decoder_large
+model:
+  token_dim: 128
+  nhead: 8
+  num_layers: 6
+  ff_dim: 512
+  dropout: 0.15
+  latent_channels: 256
+  latent_hw: 8
+  decoder_channels: [256, 128, 64, 32]   # len must be log2(image_size/latent_hw)+1
+  decoder_dropout: 0.10
 
-# ── Dataset  (CSV produced externally by COMSOL) ──────────────────────────────
-data_dir:     data
+# Model template: CNN decoder (MLP encoder + ConvTranspose decoder)
+# model_name: cnn_decoder_large
+# model:
+#   encoder_dims: [1024, 2048, 4096]
+#   dropout: 0.25
+#   latent_channels: 256
+#   latent_hw: 8
+#   decoder_channels: [256, 128, 64, 32]
+#   decoder_dropout: 0.10
+
+# Model template: BiLSTM decoder
+# model_name: bilstm_decoder_large
+# model:
+#   embed_dim: 64
+#   hidden_dim: 512
+#   num_layers: 2
+#   dropout: 0.20
+#   latent_channels: 256
+#   latent_hw: 8
+#   decoder_channels: [256, 128, 64, 32]
+#   decoder_dropout: 0.10
+
+# Model template: residual MLP (strong baseline, no convolution)
+# model_name: res_mlp_large
+# model:
+#   hidden_dim: 2048
+#   num_blocks: 8
+#   mlp_ratio: 2.0
+#   dropout: 0.25
+
+# ── Dataset (CSV produced externally by COMSOL) ──────────────────────────────
+data_dir: data
 csv_filename: eit_dataset.csv
 
-# ── Training ──────────────────────────────────────────────────────────────────
-lr:                1.0e-3
-weight_decay:      1.0e-4
-batch_size:        64
-epochs:            100
-scheduler_patience: 10         # ReduceLROnPlateau: epochs with no val improvement
-scheduler_factor:   0.5        # LR multiplier on plateau
-patience:          20          # early-stopping patience (epochs)
+# ── Training / regularisation ────────────────────────────────────────────────
+lr: 1.0e-3
+weight_decay: 1.0e-4
+batch_size: 64
+epochs: 120
+scheduler_patience: 10     # ReduceLROnPlateau patience
+scheduler_factor: 0.5      # LR multiplier on plateau
+patience: 25               # early stopping patience
+min_delta: 1.0e-6          # minimum val-improvement to reset patience
+input_noise_std: 0.01      # Gaussian noise on train input only
+max_grad_norm: 1.0         # 0 or negative disables gradient clipping
+
+# ── Visualisation (test.py) ───────────────────────────────────────────────────
+vis_gaussian_sigma: 1.0
+vis_class_threshold: 0.1
+vis_upsample: 4
+default_test_samples: 5
 
 # ── Output paths ──────────────────────────────────────────────────────────────
-checkpoint_dir:  checkpoints
-results_dir:     results
+checkpoint_dir: checkpoints
+results_dir: results
+test_log_filename: test_runs.jsonl
