@@ -1,17 +1,18 @@
 """
 EIT Dataset – Polarised Anomalies, 64x64 High-Resolution Output.
 
-Expected CSV schema  (one row = one sample, 517 columns total)
+Expected CSV schema  (one row = one sample, 262 columns total)
 ──────────────────────────────────────────────────────────────
-Col  0   x0_mm        – anomaly centre x  [mm]
-Col  1   y0_mm        – anomaly centre y  [mm]
-Col  2   r_mm         – anomaly radius    [mm]
-Col  3   sigma_bg     – background conductivity [S/m]
+Col  0   sample_id    – integer sample index
+Col  1   x0_mm        – anomaly centre x  [mm]
+Col  2   y0_mm        – anomaly centre y  [mm]
+Col  3   r_mm         – anomaly radius    [mm]
 Col  4   sigma_touch  – anomaly conductivity [S/m]
              ~50    -> conductive -> target pixel value = +1.0
              ~1e-9  -> resistive  -> target pixel value = -1.0
-Cols 5–260   V_sample_000..255  – 16x16 voltage matrix, drive-major order
-Cols 261–516 V_ref_000..255     – homogeneous-reference voltage matrix
+Col  5   sample_valid – validity flag (1 = valid)
+Cols 6–261  V_srcXX_snkYY_chZZ – 16 drive pairs × 16 measurement channels
+            (drive-major order, channels 01–16 per drive pair)
 
 The CSV is produced externally (e.g. by COMSOL) and must exist at the path
 specified by  data_dir / csv_filename  in config.yaml before training starts.
@@ -100,13 +101,13 @@ def build_pixel_grid(
 
 class EITDataset(Dataset):
     """
-    Wraps a pandas DataFrame slice and exposes (delta_v, mask) tensor pairs.
+    Wraps a pandas DataFrame slice and exposes (v_meas, mask) tensor pairs.
 
     Processing pipeline
     ───────────────────
-    1. delta_v_raw  = V_sample - V_ref                     shape (N, 256)
-    2. Apply _VALID_MASK  ->  delta_v_224                  shape (N, 224)
-    3. StandardScaler (fitted on training split only)      shape (N, 224)
+    1. v_raw    = raw voltages from V_srcXX_snkYY_chZZ columns  shape (N, 256)
+    2. Apply _VALID_MASK  ->  v_224                              shape (N, 224)
+    3. StandardScaler (fitted on training split only)            shape (N, 224)
     4. Build 64x64 target mask from geometry + sigma_touch:
          inside anomaly AND inside tank circle: +1.0 (conductive) or -1.0 (resistive)
          all other pixels                     :  0.0
@@ -129,10 +130,14 @@ class EITDataset(Dataset):
 
         xx, yy, tank_mask = build_pixel_grid(img_sz, R)
 
-        # ── Delta-V: 256 raw  ->  224 valid measurements ─────────────────────
-        vs_cols = [c for c in df.columns if c.startswith("V_sample_")]
-        vr_cols = [c for c in df.columns if c.startswith("V_ref_")]
-        dv_raw  = (df[vs_cols].values - df[vr_cols].values).astype(np.float32)
+        # ── Voltage measurements: 256 raw  ->  224 valid ─────────────────────
+        v_cols = [c for c in df.columns if c.startswith("V_src")]
+        if len(v_cols) != 256:
+            raise ValueError(
+                f"Expected 256 voltage columns (V_src...), found {len(v_cols)}. "
+                "Check CSV column names."
+            )
+        dv_raw  = df[v_cols].values.astype(np.float32)     # (N, 256)
         dv_224  = dv_raw[:, _VALID_MASK]                   # (N, 224)
 
         # ── StandardScaler ────────────────────────────────────────────────────
