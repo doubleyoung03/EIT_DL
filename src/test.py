@@ -15,8 +15,10 @@ For randomly selected test samples this script:
 
 Checkpoint selection
 ────────────────────
-  --model PATH   load a specific checkpoint file.
-  (no flag)      automatically load the newest  *.pth  file in checkpoint_dir/
+  --model PATH   load a specific checkpoint file (highest priority).
+  test_checkpoint_path in config.yaml
+                load that checkpoint when --model is not provided.
+  (otherwise)    automatically load the newest  *.pth  file in checkpoint_dir/
                  (ranked by file modification time; most recent = newest run).
 
 Usage (from project root  D:\\Yang\\EIT\\Network):
@@ -169,7 +171,8 @@ def parse_args() -> argparse.Namespace:
                    help="Path to config.yaml (default: config.yaml)")
     p.add_argument("--model",     default=None,
                    help="Path to a specific .pth checkpoint.  "
-                        "If omitted, the newest file in checkpoint_dir/ is used.")
+                        "If omitted, uses config test_checkpoint_path if set; "
+                        "otherwise uses newest file in checkpoint_dir/.")
     p.add_argument("--n-samples", type=int, default=None,
                    help="Number of test samples to visualise. "
                         "If omitted, uses config default_test_samples.")
@@ -239,14 +242,25 @@ def main() -> None:
     cls_thresh = float(cfg.get("vis_class_threshold", _DEFAULT_CLS_THRESH))
     upsample = int(cfg.get("vis_upsample", _DEFAULT_UPSAMPLE))
 
-    # ── Resolve checkpoint path ────────────────────────────────────────────────
+    # ── Resolve checkpoint path (CLI > config > newest in checkpoint_dir) ─────
     if args.model is not None:
         ckpt_path = Path(args.model)
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        print(f"[test] Using checkpoint from --model: {ckpt_path}")
     else:
-        ckpt_path = _find_latest_checkpoint(Path(cfg["checkpoint_dir"]))
-        print(f"[test] Auto-selected checkpoint: {ckpt_path.name}")
+        cfg_ckpt = cfg.get("test_checkpoint_path", None)
+        if isinstance(cfg_ckpt, str):
+            cfg_ckpt = cfg_ckpt.strip()
+
+        if cfg_ckpt:
+            ckpt_path = Path(str(cfg_ckpt))
+            if not ckpt_path.exists():
+                raise FileNotFoundError(f"Checkpoint from config not found: {ckpt_path}")
+            print(f"[test] Using checkpoint from config: {ckpt_path}")
+        else:
+            ckpt_path = _find_latest_checkpoint(Path(cfg["checkpoint_dir"]))
+            print(f"[test] Auto-selected checkpoint: {ckpt_path.name}")
 
     # ── Load checkpoint ────────────────────────────────────────────────────────
     ckpt  = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -403,6 +417,7 @@ def main() -> None:
         "seed": cfg.get("seed"),
         "test_seed": cfg.get("test_seed"),
         "deterministic": cfg.get("deterministic"),
+        "test_checkpoint_path": cfg.get("test_checkpoint_path"),
         "vis_gaussian_sigma": cfg.get("vis_gaussian_sigma"),
         "vis_class_threshold": cfg.get("vis_class_threshold"),
         "vis_upsample": cfg.get("vis_upsample"),

@@ -145,6 +145,7 @@ vis_gaussian_sigma: 1.0
 vis_class_threshold: 0.1
 vis_upsample: 4
 default_test_samples: 5
+test_checkpoint_path: null   # e.g. checkpoints/best_model_64x64_20260101_0900.pth
 
 # ── Output paths ──────────────────────────────────────────────────────────────
 checkpoint_dir: checkpoints
