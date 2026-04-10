@@ -1,14 +1,15 @@
 """
-EIT 64x64 – Test & Smooth Polarised Visualisation.
+EIT 64x64 – Test and Three-Color Visualisation.
 
-For 5 randomly selected test samples this script:
+For randomly selected test samples this script:
   1. Reports Final Test MSE and RMSE over the entire test set.
-  2. Applies scipy.ndimage.gaussian_filter (sigma=1.0) to each 64x64 prediction.
-  3. Renders GT vs. smoothed Prediction using plt.contourf (50 levels, 'RdBu_r'):
-       +1.0  -> Deep Red    (conductive anomaly)
-       -1.0  -> Deep Blue   (resistive  anomaly)
-        0.0  -> White       (background / outside-tank)
-  4. Overlays a white dashed circle at the 50 mm tank boundary on every subplot.
+  2. Uses three discrete colours only:
+       +1.0  -> Red   (conductive anomaly)
+       -1.0  -> Blue  (resistive anomaly)
+        0.0  -> White (background)
+  3. Applies Gaussian smoothing + high-resolution rendering for cleaner edges.
+  4. Hides values outside the 50 mm tank and overlays a black solid tank boundary.
+  5. Computes localisation error (mm) using predicted anomaly centroid vs GT centre.
   5. Saves to  results/final_reconstruction.png.
 
 Checkpoint selection
@@ -38,14 +39,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, zoom
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dataset import build_pixel_grid, get_dataloaders
 from model import EITReconstructor
 
-_GAUSS_SIGMA = 1.0   # smoothing radius applied to 64x64 predictions
+_GAUSS_SIGMA = 1.0
+_CLS_THRESH = 0.1
+_UPSAMPLE = 4
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -78,34 +81,34 @@ def _find_latest_checkpoint(checkpoint_dir: Path) -> Path:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _tank_outline(ax: plt.Axes, R: float) -> None:
-    """White dashed circle at the 50 mm physical tank boundary."""
+    """Draw the physical tank boundary as a black solid circle."""
     th = np.linspace(0.0, 2.0 * np.pi, 300)
     ax.plot(R * np.cos(th), R * np.sin(th),
-            color="white", linewidth=1.8, linestyle="--", zorder=5)
+            color="black", linewidth=1.4, linestyle="-", zorder=6)
 
 
 def _render(
     ax: plt.Axes,
-    X: np.ndarray,
-    Y: np.ndarray,
     Z: np.ndarray,
+    tank_mask: np.ndarray,
     title: str,
     R: float,
-) -> plt.cm.ScalarMappable:
+) -> None:
     """
-    Draw a polarised [-1, 1] field using contourf (50 filled bands, RdBu_r).
-
-    Colour convention
-    ─────────────────
-    TwoSlopeNorm with vcenter=0 ensures:
-        +1.0  Deep Red    (conductive anomaly)
-        -1.0  Deep Blue   (resistive  anomaly)
-         0.0  White       (background)
+    Draw a three-class map with outside-tank region hidden.
     """
-    norm   = mcolors.TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=1.0)
-    levels = np.linspace(-1.0, 1.0, 51)      # 50 filled colour bands
-
-    cf = ax.contourf(X, Y, Z, levels=levels, cmap="RdBu_r", norm=norm)
+    cmap = mcolors.ListedColormap(["#2166AC", "#FFFFFF", "#B2182B"])
+    cmap.set_bad((1.0, 1.0, 1.0, 0.0))
+    norm = mcolors.BoundaryNorm(boundaries=[-1.5, -0.5, 0.5, 1.5], ncolors=3)
+    Z_masked = np.ma.array(Z, mask=~tank_mask)
+    ax.imshow(
+        Z_masked,
+        cmap=cmap,
+        norm=norm,
+        origin="upper",
+        extent=[-R, R, -R, R],
+        interpolation="nearest",
+    )
     _tank_outline(ax, R)
 
     ax.set_title(title, fontsize=9, pad=4)
@@ -113,7 +116,43 @@ def _render(
     ax.set_ylabel("y  [mm]", fontsize=8)
     ax.set_aspect("equal")
     ax.tick_params(labelsize=7)
-    return cf
+
+
+def _to_three_class(z: np.ndarray, thr: float) -> np.ndarray:
+    """Convert continuous map to {-1, 0, +1} by symmetric thresholding."""
+    out = np.zeros_like(z, dtype=np.int8)
+    out[z >= thr] = 1
+    out[z <= -thr] = -1
+    return out
+
+
+def _centroid_mm(
+    pred_hi: np.ndarray,
+    polarity: float,
+    thr: float,
+    xx_hi: np.ndarray,
+    yy_hi: np.ndarray,
+    tank_mask_hi: np.ndarray,
+) -> tuple[float, float]:
+    """
+    Compute centroid in mm from high-resolution prediction map.
+    Falls back to extremum point if thresholded region is empty.
+    """
+    if polarity > 0:
+        region = (pred_hi >= thr) & tank_mask_hi
+    else:
+        region = (pred_hi <= -thr) & tank_mask_hi
+
+    if np.any(region):
+        return float(xx_hi[region].mean()), float(yy_hi[region].mean())
+
+    pred_masked = np.where(tank_mask_hi, pred_hi, np.nan)
+    if polarity > 0:
+        ridx = int(np.nanargmax(pred_masked))
+    else:
+        ridx = int(np.nanargmin(pred_masked))
+    rr, cc = np.unravel_index(ridx, pred_hi.shape)
+    return float(xx_hi[rr, cc]), float(yy_hi[rr, cc])
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -129,8 +168,9 @@ def parse_args() -> argparse.Namespace:
                         "If omitted, the newest file in checkpoint_dir/ is used.")
     p.add_argument("--n-samples", type=int, default=5,
                    help="Number of test samples to visualise (default: 5)")
-    p.add_argument("--seed",      type=int, default=0,
-                   help="Random seed for sample selection (default: 0)")
+    p.add_argument("--seed",      type=int, default=None,
+                   help="Random seed for sample selection. "
+                        "If omitted, samples are random each run.")
     return p.parse_args()
 
 
@@ -186,11 +226,15 @@ def main() -> None:
     # ── Sample selection ───────────────────────────────────────────────────────
     n    = min(args.n_samples, len(test_ds))
     rng  = np.random.default_rng(args.seed)
+    if args.seed is None:
+        print("[test] Sample selection: random (no fixed seed)")
+    else:
+        print(f"[test] Sample selection seed: {args.seed}")
     idxs = rng.choice(len(test_ds), size=n, replace=False)
 
-    # ── Coordinate grid for contourf (matches the 64x64 pixel layout) ─────────
-    coords = (np.arange(img_sz) + 0.5) * (2.0 * R / img_sz) - R
-    X, Y   = np.meshgrid(coords, coords[::-1])   # (64, 64) each
+    # ── High-resolution grid for smoother display/localisation ────────────────
+    hi_sz = img_sz * _UPSAMPLE
+    xx_hi, yy_hi, tank_mask_hi = build_pixel_grid(hi_sz, R)
 
     # ── Batch inference ────────────────────────────────────────────────────────
     x_batch = torch.from_numpy(test_ds.delta_v[idxs]).to(device)   # (n, 224)
@@ -199,6 +243,7 @@ def main() -> None:
 
     gts     = test_ds.masks[idxs, 0]                                # (n, 64, 64)
     per_mse = ((preds - gts) ** 2).mean(axis=(1, 2))                # (n,)
+    loc_errs_mm = []
 
     # ── Figure ────────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(n, 2, figsize=(9.5, n * 4.2))
@@ -206,32 +251,61 @@ def main() -> None:
         axes = axes[None, :]
 
     for row, (idx, mse_i) in enumerate(zip(idxs, per_mse)):
-        polarity = "Conductive" if test_ds.polarity[idx] > 0 else "Resistive"
-        gt       = gts[row]
-        pred_s   = gaussian_filter(preds[row], sigma=_GAUSS_SIGMA)
+        pol_sign = float(test_ds.polarity[idx])
+        polarity = "Conductive" if pol_sign > 0 else "Resistive"
+        x0_mm = float(test_ds.x0[idx])
+        y0_mm = float(test_ds.y0[idx])
+        r_mm = float(test_ds.r_anom[idx])
 
-        cf_gt = _render(
-            axes[row, 0], X, Y, gt,
+        # Build an analytic high-resolution GT disk for smoother circle boundary.
+        gt_hi = np.zeros((hi_sz, hi_sz), dtype=np.int8)
+        in_anomaly = ((xx_hi - x0_mm) ** 2 + (yy_hi - y0_mm) ** 2 <= r_mm ** 2) & tank_mask_hi
+        gt_hi[in_anomaly] = 1 if pol_sign > 0 else -1
+
+        # Smooth prediction, upsample, then quantise to three classes.
+        pred_s = gaussian_filter(preds[row], sigma=_GAUSS_SIGMA)
+        pred_hi = zoom(pred_s, zoom=_UPSAMPLE, order=1)
+        pred_cls_hi = _to_three_class(pred_hi, thr=_CLS_THRESH)
+
+        x_pred_mm, y_pred_mm = _centroid_mm(
+            pred_hi=pred_hi,
+            polarity=pol_sign,
+            thr=_CLS_THRESH,
+            xx_hi=xx_hi,
+            yy_hi=yy_hi,
+            tank_mask_hi=tank_mask_hi,
+        )
+        loc_err_mm = math.hypot(x_pred_mm - x0_mm, y_pred_mm - y0_mm)
+        loc_errs_mm.append(loc_err_mm)
+
+        _render(
+            axes[row, 0], gt_hi, tank_mask_hi,
             title=f"[{idx:04d}]  Ground Truth  ({polarity})",
             R=R,
         )
-        plt.colorbar(cf_gt, ax=axes[row, 0], fraction=0.046, pad=0.04)
-
-        cf_pr = _render(
-            axes[row, 1], X, Y, pred_s,
+        _render(
+            axes[row, 1], pred_cls_hi, tank_mask_hi,
             title=(f"[{idx:04d}]  Prediction  "
-                   f"(RMSE = {math.sqrt(float(mse_i)):.4f})"
-                   f"  [gauss sigma={_GAUSS_SIGMA}]"),
+                   f"(RMSE = {math.sqrt(float(mse_i)):.4f}, "
+                   f"LocErr = {loc_err_mm:.2f} mm)"),
             R=R,
         )
-        plt.colorbar(cf_pr, ax=axes[row, 1], fraction=0.046, pad=0.04)
+        print(
+            f"[test] Sample {idx:04d} | GT=({x0_mm:.2f}, {y0_mm:.2f}) mm  "
+            f"Pred=({x_pred_mm:.2f}, {y_pred_mm:.2f}) mm  "
+            f"LocErr={loc_err_mm:.2f} mm"
+        )
+
+    loc_errs_mm = np.asarray(loc_errs_mm, dtype=np.float64)
+    print(f"[test] Localisation Error Mean   = {loc_errs_mm.mean():.2f} mm")
+    print(f"[test] Localisation Error Median = {np.median(loc_errs_mm):.2f} mm")
+    print(f"[test] Localisation Error P90    = {np.percentile(loc_errs_mm, 90):.2f} mm")
 
     fig.suptitle(
         f"EIT 64x64 Reconstruction  |  Test MSE = {test_mse:.5f}  "
         f"RMSE = {test_rmse:.5f}\n"
-        "Deep Red = Conductive (+1.0)   |   Deep Blue = Resistive (-1.0)"
-        "   |   White = Background (0.0)\n"
-        "White dashed circle = 50 mm tank boundary",
+        "Red = Conductive (+1)   |   Blue = Resistive (-1)   |   White = Background (0)\n"
+        "Black solid circle = 50 mm tank boundary; outside-tank region is hidden",
         fontsize=10,
         y=1.01,
     )
