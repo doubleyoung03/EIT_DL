@@ -10,8 +10,9 @@ For randomly selected test samples this script:
   3. Applies Gaussian smoothing + high-resolution rendering for cleaner edges.
   4. Hides values outside the 50 mm tank and overlays a black solid tank boundary.
   5. Computes localisation error (mm) using predicted anomaly centroid vs GT centre.
-  5. Saves to  results/reconstruction_<checkpoint_stem>.png.
-  6. Appends a JSONL test record to results/test_runs.jsonl.
+  6. Computes anomaly area error (mm^2 and %) on visualised samples.
+  7. Saves to  results/reconstruction_<checkpoint_stem>.png.
+  8. Appends a JSONL test record to results/test_runs.jsonl.
 
 Checkpoint selection
 ────────────────────
@@ -221,6 +222,20 @@ def _centroid_mm(
     return float(xx_hi[rr, cc]), float(yy_hi[rr, cc])
 
 
+def _anomaly_area_mm2(
+    cls_map: np.ndarray,
+    polarity: float,
+    tank_mask: np.ndarray,
+    pixel_area_mm2: float,
+) -> float:
+    """
+    Compute anomaly area in mm^2 from a three-class map and known polarity.
+    """
+    cls_val = 1 if polarity > 0 else -1
+    area_px = np.count_nonzero((cls_map == cls_val) & tank_mask)
+    return float(area_px) * pixel_area_mm2
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
@@ -396,6 +411,7 @@ def main() -> None:
     # ── High-resolution grid for smoother display/localisation ────────────────
     hi_sz = img_sz * upsample
     xx_hi, yy_hi, tank_mask_hi = build_pixel_grid(hi_sz, R)
+    hi_pixel_area_mm2 = (2.0 * R / hi_sz) ** 2
 
     # ── Batch inference ────────────────────────────────────────────────────────
     x_batch = torch.from_numpy(test_ds.delta_v[idxs]).to(device)   # (n, 224)
@@ -405,6 +421,9 @@ def main() -> None:
     gts     = test_ds.masks[idxs, 0]                                # (n, 64, 64)
     per_mse = ((preds - gts) ** 2).mean(axis=(1, 2))                # (n,)
     loc_errs_mm = []
+    area_errs_mm2 = []
+    area_errs_rel = []
+    area_bias_rel = []
 
     # ── Figure ────────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(n, 2, figsize=(9.5, n * 4.2))
@@ -439,6 +458,26 @@ def main() -> None:
         loc_err_mm = math.hypot(x_pred_mm - x0_mm, y_pred_mm - y0_mm)
         loc_errs_mm.append(loc_err_mm)
 
+        gt_area_mm2 = _anomaly_area_mm2(
+            cls_map=gt_hi,
+            polarity=pol_sign,
+            tank_mask=tank_mask_hi,
+            pixel_area_mm2=hi_pixel_area_mm2,
+        )
+        pred_area_mm2 = _anomaly_area_mm2(
+            cls_map=pred_cls_hi,
+            polarity=pol_sign,
+            tank_mask=tank_mask_hi,
+            pixel_area_mm2=hi_pixel_area_mm2,
+        )
+        area_err_mm2 = abs(pred_area_mm2 - gt_area_mm2)
+        rel_den = max(gt_area_mm2, 1e-12)
+        area_err_rel = area_err_mm2 / rel_den
+        area_bias = (pred_area_mm2 - gt_area_mm2) / rel_den
+        area_errs_mm2.append(area_err_mm2)
+        area_errs_rel.append(area_err_rel)
+        area_bias_rel.append(area_bias)
+
         _render(
             axes[row, 0], gt_hi, tank_mask_hi,
             title=f"[{idx:04d}]  Ground Truth  ({polarity})",
@@ -448,19 +487,36 @@ def main() -> None:
             axes[row, 1], pred_cls_hi, tank_mask_hi,
             title=(f"[{idx:04d}]  Prediction  "
                    f"(RMSE = {math.sqrt(float(mse_i)):.4f}, "
-                   f"LocErr = {loc_err_mm:.2f} mm)"),
+                   f"LocErr = {loc_err_mm:.2f} mm, "
+                   f"AreaErr = {area_err_rel * 100.0:.1f}%)"),
             R=R,
         )
         print(
             f"[test] Sample {idx:04d} | GT=({x0_mm:.2f}, {y0_mm:.2f}) mm  "
             f"Pred=({x_pred_mm:.2f}, {y_pred_mm:.2f}) mm  "
-            f"LocErr={loc_err_mm:.2f} mm"
+            f"LocErr={loc_err_mm:.2f} mm  "
+            f"Area(GT={gt_area_mm2:.2f}, Pred={pred_area_mm2:.2f}) mm^2  "
+            f"AreaErr={area_err_rel * 100.0:.1f}%"
         )
 
     loc_errs_mm = np.asarray(loc_errs_mm, dtype=np.float64)
+    area_errs_mm2 = np.asarray(area_errs_mm2, dtype=np.float64)
+    area_errs_rel = np.asarray(area_errs_rel, dtype=np.float64)
+    area_bias_rel = np.asarray(area_bias_rel, dtype=np.float64)
     print(f"[test] Localisation Error Mean   = {loc_errs_mm.mean():.2f} mm")
     print(f"[test] Localisation Error Median = {np.median(loc_errs_mm):.2f} mm")
     print(f"[test] Localisation Error P90    = {np.percentile(loc_errs_mm, 90):.2f} mm")
+    print(f"[test] Area Error MeanAbs        = {area_errs_mm2.mean():.2f} mm^2")
+    print(f"[test] Area Error MedianAbs      = {np.median(area_errs_mm2):.2f} mm^2")
+    print(f"[test] Area Error P90Abs         = {np.percentile(area_errs_mm2, 90):.2f} mm^2")
+    print(f"[test] Area Error MeanRel        = {area_errs_rel.mean() * 100.0:.2f}%")
+    print(f"[test] Area Error MedianRel      = {np.median(area_errs_rel) * 100.0:.2f}%")
+    print(f"[test] Area Error P90Rel         = {np.percentile(area_errs_rel, 90) * 100.0:.2f}%")
+    print(
+        "[test] Area Bias MeanSigned     = "
+        f"{area_bias_rel.mean() * 100.0:.2f}% "
+        "(+ means predicted area is larger)"
+    )
 
     fig.suptitle(
         f"EIT 64x64 Reconstruction  |  Test MSE = {test_mse:.5f}  "
@@ -483,6 +539,13 @@ def main() -> None:
     loc_mean = float(loc_errs_mm.mean())
     loc_median = float(np.median(loc_errs_mm))
     loc_p90 = float(np.percentile(loc_errs_mm, 90))
+    area_abs_mean = float(area_errs_mm2.mean())
+    area_abs_median = float(np.median(area_errs_mm2))
+    area_abs_p90 = float(np.percentile(area_errs_mm2, 90))
+    area_rel_mean = float(area_errs_rel.mean())
+    area_rel_median = float(np.median(area_errs_rel))
+    area_rel_p90 = float(np.percentile(area_errs_rel, 90))
+    area_bias_mean = float(area_bias_rel.mean())
 
     cfg_snapshot = {
         "input_dim": cfg.get("input_dim"),
@@ -534,6 +597,13 @@ def main() -> None:
             "loc_err_mean_mm": loc_mean,
             "loc_err_median_mm": loc_median,
             "loc_err_p90_mm": loc_p90,
+            "area_err_abs_mean_mm2": area_abs_mean,
+            "area_err_abs_median_mm2": area_abs_median,
+            "area_err_abs_p90_mm2": area_abs_p90,
+            "area_err_rel_mean": area_rel_mean,
+            "area_err_rel_median": area_rel_median,
+            "area_err_rel_p90": area_rel_p90,
+            "area_bias_mean_signed": area_bias_mean,
         },
         "threshold_calibration": threshold_stats,
     }

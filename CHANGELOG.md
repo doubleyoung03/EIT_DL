@@ -55,3 +55,35 @@ manual trial-and-error and improving shape-size consistency.
 - Linter: no errors introduced in modified files.
 - Syntax check: `python -m py_compile src/test.py src/train.py src/dataset.py` passed.
 - Runtime note: `python src/test.py` currently cannot complete because no `.pth` checkpoint exists in `checkpoints/`.
+
+## 2026-04-12 — Add Composite Training Loss And Area Error Metrics
+
+### What changed
+Added a configurable composite training objective to better control reconstruction
+shape quality and over-segmentation:
+`total = w_mse * MSE + w_dice * DiceForeground + w_area * AreaRatioPenalty`.
+`train.py` now supports `loss_name: mse | composite`, logs both objective and MSE,
+and stores selected loss settings in checkpoints.
+
+`test.py` now computes and reports anomaly area error on visualised samples,
+including absolute error (mm^2), relative error (%), and signed area bias (%).
+Per-sample console output and prediction panel titles now include area error.
+Area metrics are also appended into the JSONL test log.
+
+### Why
+The model tended to predict anomaly regions that were larger than ground truth.
+MSE alone optimizes pixel intensity but does not strongly constrain shape overlap
+or area. The new Dice + area-ratio terms provide direct supervision on footprint
+consistency, while added test metrics make over/under-segmentation visible.
+
+### Files affected
+| File | Change |
+|------|--------|
+| `src/train.py` | Added `CompositeReconstructionLoss`, configurable loss builder, objective-aware training/validation logging, and checkpoint fields for loss settings. |
+| `config.yaml` | Added `loss_name` and `loss` weights (`mse_weight`, `dice_weight`, `area_weight`, `eps`) with composite defaults. |
+| `src/test.py` | Added area computation helper, per-sample area error reporting, aggregate area error statistics, and JSONL metric fields for area errors/bias. |
+
+### Validation
+- Linter: no errors introduced in modified files.
+- Syntax check: `python -m py_compile src/train.py src/test.py src/dataset.py` passed.
+- Runtime note: end-to-end `src/test.py` still requires an available checkpoint file.

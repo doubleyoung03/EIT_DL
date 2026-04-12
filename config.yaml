@@ -136,6 +136,14 @@ min_delta: 1.0e-6          # minimum val-improvement to reset patience
 input_noise_std: 0.01      # Gaussian noise on train input only
 max_grad_norm: 1.0         # 0 or negative disables gradient clipping
 
+# ── Training objective ─────────────────────────────────────────────────────────
+loss_name: composite        # mse | composite
+loss:
+  mse_weight: 0.60
+  dice_weight: 0.30
+  area_weight: 0.10
+  eps: 1.0e-6
+
 # ── Reproducibility ───────────────────────────────────────────────────────────
 seed: 42                   # set null for fully random runs
 test_seed: 42              # seed used by test.py when --seed is not passed
