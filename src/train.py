@@ -253,6 +253,7 @@ def main() -> None:
                     "loss_curve_path": str(loss_curve_path),
                     "scaler_mean":  test_ds.scaler.mean_,
                     "scaler_std":   test_ds.scaler.scale_,
+                    "reference_voltage_csv": cfg.get("reference_voltage_csv"),
                 },
                 best_path,
             )

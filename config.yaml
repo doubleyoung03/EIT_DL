@@ -121,6 +121,7 @@ model:
 # ── Dataset (CSV produced externally by COMSOL) ──────────────────────────────
 data_dir: data
 csv_filename: eit_dataset.csv
+reference_voltage_csv: reference_voltages.csv   # homogeneous-medium baseline
 
 # ── Training / regularisation ────────────────────────────────────────────────
 lr: 1.0e-3

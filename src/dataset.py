@@ -14,6 +14,12 @@ Col  5   sample_valid – validity flag (1 = valid)
 Cols 6–261  V_srcXX_snkYY_chZZ – 16 drive pairs × 16 measurement channels
             (drive-major order, channels 01–16 per drive pair)
 
+Reference voltage CSV  (one row, 256 V_src columns)
+────────────────────────────────────────────────────
+Homogeneous-medium baseline measured/simulated without any anomaly.
+Used to compute the differential normalised input:
+    dv_norm = (V_measured - V_ref) / |V_ref|
+
 The CSV is produced externally (e.g. by COMSOL) and must exist at the path
 specified by  data_dir / csv_filename  in config.yaml before training starts.
 No synthetic data generation is performed here.
@@ -122,22 +128,26 @@ class EITDataset(Dataset):
     ───────────────────
     1. v_raw    = raw voltages from V_srcXX_snkYY_chZZ columns  shape (N, 256)
     2. Apply _VALID_MASK  ->  v_224                              shape (N, 224)
-    3. StandardScaler (fitted on training split only)            shape (N, 224)
-    4. Build 64x64 target mask from geometry + sigma_touch:
+    3. Differential normalization:
+         dv = (v_224 - v_ref) / |v_ref|                         shape (N, 224)
+    4. StandardScaler (fitted on training split only)            shape (N, 224)
+    5. Build 64x64 target mask from geometry + sigma_touch:
          inside anomaly AND inside tank circle: +1.0 (conductive) or -1.0 (resistive)
          all other pixels                     :  0.0
 
     Parameters
     ----------
-    df     : pandas DataFrame – a contiguous row-slice of the full CSV.
-    config : dict with keys: image_size, tank_radius.
-    scaler : pre-fitted StandardScaler, or None to fit on this split.
+    df        : pandas DataFrame – a contiguous row-slice of the full CSV.
+    config    : dict with keys: image_size, tank_radius.
+    v_ref_224 : (224,) float32 array – masked homogeneous-medium reference voltages.
+    scaler    : pre-fitted StandardScaler, or None to fit on this split.
     """
 
     def __init__(
         self,
         df: pd.DataFrame,
         config: dict,
+        v_ref_224: np.ndarray,
         scaler: StandardScaler | None = None,
     ) -> None:
         img_sz = int(config["image_size"])
@@ -152,8 +162,13 @@ class EITDataset(Dataset):
                 f"Expected 256 voltage columns (V_src...), found {len(v_cols)}. "
                 "Check CSV column names."
             )
-        dv_raw  = df[v_cols].values.astype(np.float32)     # (N, 256)
-        dv_224  = dv_raw[:, _VALID_MASK]                   # (N, 224)
+        v_raw  = df[v_cols].values.astype(np.float32)      # (N, 256)
+        v_224  = v_raw[:, _VALID_MASK]                     # (N, 224)
+
+        # ── Differential normalization w.r.t. homogeneous reference ───────────
+        #    dv_norm = (V_measured - V_ref) / |V_ref|
+        ref = v_ref_224[None, :]                           # (1, 224) broadcast
+        dv_224 = (v_224 - ref) / np.abs(ref)               # (N, 224)
 
         # ── StandardScaler ────────────────────────────────────────────────────
         if scaler is None:
@@ -234,6 +249,28 @@ def get_dataloaders(
             "Please place your COMSOL-exported CSV at that path before training."
         )
 
+    # ── Load reference voltages (homogeneous-medium baseline) ─────────────────
+    ref_csv = config.get("reference_voltage_csv")
+    if ref_csv is None:
+        raise ValueError(
+            "config must contain 'reference_voltage_csv' pointing to the "
+            "homogeneous-medium reference voltage file."
+        )
+    ref_path = Path(config["data_dir"]) / ref_csv
+    if not ref_path.exists():
+        raise FileNotFoundError(
+            f"Reference voltage CSV not found: {ref_path}\n"
+            "Please place your homogeneous-medium voltage CSV at that path."
+        )
+    ref_df = pd.read_csv(ref_path)
+    ref_v_cols = [c for c in ref_df.columns if c.startswith("V_src")]
+    if len(ref_v_cols) != 256:
+        raise ValueError(
+            f"Expected 256 voltage columns in reference CSV, found {len(ref_v_cols)}."
+        )
+    v_ref_224 = ref_df[ref_v_cols].values.astype(np.float32).ravel()[_VALID_MASK]
+    print(f"[dataset] Reference voltages loaded from {ref_path}  ({v_ref_224.shape[0]} channels)")
+
     # ── Load  (size determined dynamically from the file) ─────────────────────
     print(f"[dataset] Reading {csv_path} ...")
     df = pd.read_csv(csv_path)
@@ -261,9 +298,9 @@ def get_dataloaders(
     print(f"[dataset] Split -> train={len(tr_idx)}  val={len(va_idx)}  test={len(te_idx)}")
 
     # ── Build datasets (scaler fitted on train split only) ────────────────────
-    train_ds = EITDataset(df.iloc[tr_idx].reset_index(drop=True), config, scaler=None)
-    val_ds   = EITDataset(df.iloc[va_idx].reset_index(drop=True), config, scaler=train_ds.scaler)
-    test_ds  = EITDataset(df.iloc[te_idx].reset_index(drop=True), config, scaler=train_ds.scaler)
+    train_ds = EITDataset(df.iloc[tr_idx].reset_index(drop=True), config, v_ref_224, scaler=None)
+    val_ds   = EITDataset(df.iloc[va_idx].reset_index(drop=True), config, v_ref_224, scaler=train_ds.scaler)
+    test_ds  = EITDataset(df.iloc[te_idx].reset_index(drop=True), config, v_ref_224, scaler=train_ds.scaler)
 
     bs  = int(config["batch_size"])
     pin = torch.cuda.is_available()
