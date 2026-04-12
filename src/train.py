@@ -8,9 +8,9 @@ Usage (from project root  D:\\Yang\\EIT\\Network):
 Pipeline
 ────────
 1.  get_dataloaders() reads the COMSOL CSV; raises FileNotFoundError if absent.
-2.  Trains with a configurable objective (`mse` or `composite`).
-3.  ReduceLROnPlateau  (patience=10, factor=0.5) monitors val objective.
-4.  Logs train/val objective + MSE/RMSE + LR every epoch.
+2.  Trains with nn.MSELoss().
+3.  ReduceLROnPlateau  (patience=10, factor=0.5) monitors val MSE.
+4.  Logs  Ep | TrMSE | TrRMSE | VaMSE | VaRMSE | LR  every epoch.
 5.  Saves best checkpoint to  checkpoints/best_model_64x64_YYYYMMDD_HHMM.pth
     (timestamp is set when training begins; the same path is used throughout).
 6.  Early-stops when val MSE shows no improvement for `patience` epochs.
@@ -33,95 +33,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dataset import get_dataloaders
 from model import EITReconstructor
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-
-class CompositeReconstructionLoss(nn.Module):
-    """
-    Composite objective for EIT map reconstruction:
-        total = w_mse * MSE + w_dice * DiceForeground + w_area * AreaRatioPenalty
-    """
-
-    def __init__(
-        self,
-        mse_weight: float = 0.6,
-        dice_weight: float = 0.3,
-        area_weight: float = 0.1,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        self.mse_weight = float(mse_weight)
-        self.dice_weight = float(dice_weight)
-        self.area_weight = float(area_weight)
-        self.eps = float(eps)
-
-        if min(self.mse_weight, self.dice_weight, self.area_weight) < 0:
-            raise ValueError("Composite loss weights must be non-negative.")
-        if (self.mse_weight + self.dice_weight + self.area_weight) <= 0:
-            raise ValueError("At least one composite loss weight must be positive.")
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        loss_mse = F.mse_loss(pred, target)
-
-        pred_fg = pred.abs().clamp(0.0, 1.0)
-        gt_fg = target.abs().clamp(0.0, 1.0)
-        reduce_dims = tuple(range(1, pred.ndim))
-
-        inter = (pred_fg * gt_fg).sum(dim=reduce_dims)
-        pred_area = pred_fg.sum(dim=reduce_dims)
-        gt_area = gt_fg.sum(dim=reduce_dims)
-
-        loss_dice = 1.0 - ((2.0 * inter + self.eps) / (pred_area + gt_area + self.eps))
-        loss_dice = loss_dice.mean()
-
-        area_ratio = (pred_area + self.eps) / (gt_area + self.eps)
-        loss_area = (torch.log(area_ratio) ** 2).mean()
-
-        return (
-            self.mse_weight * loss_mse
-            + self.dice_weight * loss_dice
-            + self.area_weight * loss_area
-        )
-
-
-def build_loss(cfg: dict) -> tuple[nn.Module, str, dict]:
-    """
-    Build training objective from config.
-    """
-    loss_name = str(cfg.get("loss_name", "mse")).strip().lower()
-    if loss_name == "mse":
-        return nn.MSELoss(), "mse", {
-            "mse_weight": 1.0,
-            "dice_weight": 0.0,
-            "area_weight": 0.0,
-            "eps": 1e-6,
-        }
-    if loss_name == "composite":
-        loss_cfg = cfg.get("loss", {}) or {}
-        mse_w = float(loss_cfg.get("mse_weight", 0.6))
-        dice_w = float(loss_cfg.get("dice_weight", 0.3))
-        area_w = float(loss_cfg.get("area_weight", 0.1))
-        eps = float(loss_cfg.get("eps", 1e-6))
-        return CompositeReconstructionLoss(
-            mse_weight=mse_w,
-            dice_weight=dice_w,
-            area_weight=area_w,
-            eps=eps,
-        ), "composite", {
-            "mse_weight": mse_w,
-            "dice_weight": dice_w,
-            "area_weight": area_w,
-            "eps": eps,
-        }
-    raise ValueError("loss_name must be either 'mse' or 'composite'.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -161,7 +78,7 @@ def run_epoch(
     optimiser: torch.optim.Optimizer | None = None,
     input_noise_std: float = 0.0,
     max_grad_norm: float = 0.0,
-) -> tuple[float, float, float]:
+) -> tuple[float, float]:
     """
     One forward (and optional backward) pass over a DataLoader.
 
@@ -171,12 +88,12 @@ def run_epoch(
 
     Returns
     -------
-    (mean_loss, mean_MSE, RMSE) aggregated over the full loader.
+    (mean_MSE, RMSE) aggregated over the full loader.
     """
     training = optimiser is not None
     model.train(training)
 
-    total_loss, total_mse, n_seen = 0.0, 0.0, 0
+    total_loss, n_seen = 0.0, 0
     ctx = torch.enable_grad() if training else torch.no_grad()
 
     with ctx:
@@ -186,21 +103,17 @@ def run_epoch(
                 x = x + torch.randn_like(x) * input_noise_std
             if training:
                 optimiser.zero_grad(set_to_none=True)
-            pred = model(x)
-            loss = criterion(pred, y)
-            mse = F.mse_loss(pred, y)
+            loss = criterion(model(x), y)
             if training:
                 loss.backward()
                 if max_grad_norm > 0:
                     nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimiser.step()
             total_loss += loss.item() * len(x)
-            total_mse  += mse.item() * len(x)
             n_seen     += len(x)
 
-    mean_loss = total_loss / n_seen
-    mean_mse = total_mse / n_seen
-    return mean_loss, mean_mse, math.sqrt(mean_mse)
+    mse = total_loss / n_seen
+    return mse, math.sqrt(mse)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -208,16 +121,16 @@ def run_epoch(
 def save_loss_curve(
     out_path: Path,
     epochs: list[int],
-    train_loss: list[float],
-    val_loss: list[float],
+    train_mse: list[float],
+    val_mse: list[float],
     lrs: list[float],
 ) -> None:
-    """Save train/val objective curve and LR trend."""
+    """Save train/val loss curve and LR trend."""
     fig, ax1 = plt.subplots(figsize=(8.0, 5.0))
-    ax1.plot(epochs, train_loss, color="#1f77b4", linewidth=2.0, label="Train Loss")
-    ax1.plot(epochs, val_loss, color="#d62728", linewidth=2.0, label="Val Loss")
+    ax1.plot(epochs, train_mse, color="#1f77b4", linewidth=2.0, label="Train MSE")
+    ax1.plot(epochs, val_mse, color="#d62728", linewidth=2.0, label="Val MSE")
     ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Objective")
+    ax1.set_ylabel("MSE")
     ax1.grid(alpha=0.3, linestyle="--")
 
     ax2 = ax1.twinx()
@@ -273,13 +186,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[train] parameters    = {n_params:,}")
 
-    criterion, loss_name, loss_cfg = build_loss(cfg)
-    print(
-        "[train] loss objective = "
-        f"{loss_name} (mse={loss_cfg['mse_weight']:.3f}, "
-        f"dice={loss_cfg['dice_weight']:.3f}, "
-        f"area={loss_cfg['area_weight']:.3f})"
-    )
+    criterion = nn.MSELoss()
     optimiser = torch.optim.Adam(
         model.parameters(),
         lr           = float(cfg["lr"]),
@@ -294,7 +201,6 @@ def main() -> None:
     )
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    best_val_loss = float("inf")
     best_val_mse = float("inf")
     patience_cnt = 0
     es_patience  = int(cfg["patience"])
@@ -307,13 +213,13 @@ def main() -> None:
     va_hist: list[float] = []
     lr_hist: list[float] = []
 
-    hdr = (f"{'Ep':>5}  {'TrLoss':>10}  {'TrMSE':>10}  {'TrRMSE':>10}  "
-           f"{'VaLoss':>10}  {'VaMSE':>10}  {'VaRMSE':>10}  {'LR':>9}")
+    hdr = (f"{'Ep':>5}  {'TrMSE':>10}  {'TrRMSE':>10}  "
+           f"{'VaMSE':>10}  {'VaRMSE':>10}  {'LR':>9}")
     print(f"\n{hdr}")
     print("-" * len(hdr))
 
     for epoch in range(1, int(cfg["epochs"]) + 1):
-        tr_loss, tr_mse, tr_rmse = run_epoch(
+        tr_mse, tr_rmse = run_epoch(
             model=model,
             loader=train_loader,
             criterion=criterion,
@@ -322,17 +228,16 @@ def main() -> None:
             input_noise_std=input_noise_std,
             max_grad_norm=max_grad_norm,
         )
-        va_loss, va_mse, va_rmse = run_epoch(model, val_loader, criterion, device)
-        scheduler.step(va_loss)
+        va_mse, va_rmse = run_epoch(model, val_loader,   criterion, device)
+        scheduler.step(va_mse)
         lr = optimiser.param_groups[0]["lr"]
         epochs_hist.append(epoch)
-        tr_hist.append(tr_loss)
-        va_hist.append(va_loss)
+        tr_hist.append(tr_mse)
+        va_hist.append(va_mse)
         lr_hist.append(float(lr))
 
         tag = ""
-        if va_loss < (best_val_loss - min_delta):
-            best_val_loss = va_loss
+        if va_mse < (best_val_mse - min_delta):
             best_val_mse = va_mse
             patience_cnt = 0
             torch.save(
@@ -343,9 +248,6 @@ def main() -> None:
                     "model_name":   model_name,
                     "model_state":  model.state_dict(),
                     "config":       cfg,
-                    "loss_name":    loss_name,
-                    "loss":         loss_cfg,
-                    "val_loss":     best_val_loss,
                     "val_mse":      best_val_mse,
                     "loss_curve_filename": loss_curve_path.name,
                     "loss_curve_path": str(loss_curve_path),
@@ -360,23 +262,22 @@ def main() -> None:
             patience_cnt += 1
 
         print(
-            f"{epoch:>5}  {tr_loss:>10.6f}  {tr_mse:>10.6f}  {tr_rmse:>10.6f}  "
-            f"{va_loss:>10.6f}  {va_mse:>10.6f}  {va_rmse:>10.6f}  {lr:>9.2e}{tag}"
+            f"{epoch:>5}  {tr_mse:>10.6f}  {tr_rmse:>10.6f}  "
+            f"{va_mse:>10.6f}  {va_rmse:>10.6f}  {lr:>9.2e}{tag}"
         )
 
         if patience_cnt >= es_patience:
             print(f"\n[train] Early stopping at epoch {epoch}.")
             break
 
-    print(f"\n[train] Best val Loss = {best_val_loss:.6f}")
-    print(f"[train] Best val MSE  = {best_val_mse:.6f}"
+    print(f"\n[train] Best val MSE  = {best_val_mse:.6f}"
           f"  (RMSE = {math.sqrt(best_val_mse):.6f})")
     print(f"[train] Checkpoint    -> {best_path}")
     save_loss_curve(
         out_path=loss_curve_path,
         epochs=epochs_hist,
-        train_loss=tr_hist,
-        val_loss=va_hist,
+        train_mse=tr_hist,
+        val_mse=va_hist,
         lrs=lr_hist,
     )
     print(f"[train] Loss curve    -> {loss_curve_path}")
@@ -384,8 +285,7 @@ def main() -> None:
     # ── Final test-set evaluation with the best saved weights ─────────────────
     ckpt = torch.load(best_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
-    te_loss, te_mse, te_rmse = run_epoch(model, test_loader, criterion, device)
-    print(f"[train] Test  Loss    = {te_loss:.6f}")
+    te_mse, te_rmse = run_epoch(model, test_loader, criterion, device)
     print(f"[train] Test  MSE     = {te_mse:.6f}"
           f"  (RMSE = {te_rmse:.6f})")
 
