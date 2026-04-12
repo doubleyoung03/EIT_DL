@@ -55,6 +55,9 @@ from model import EITReconstructor
 _DEFAULT_GAUSS_SIGMA = 1.0
 _DEFAULT_CLS_THRESH = 0.1
 _DEFAULT_UPSAMPLE = 4
+_DEFAULT_AUTO_THRESH = False
+_DEFAULT_THR_CANDIDATES = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40]
+_DEFAULT_THR_CALIB_SAMPLES = 256
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -130,6 +133,63 @@ def _to_three_class(z: np.ndarray, thr: float) -> np.ndarray:
     out[z >= thr] = 1
     out[z <= -thr] = -1
     return out
+
+
+def _resolve_threshold_candidates(cfg: dict) -> list[float]:
+    """
+    Resolve candidate thresholds used by auto-threshold calibration.
+    """
+    raw = cfg.get("vis_threshold_candidates", _DEFAULT_THR_CANDIDATES)
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("vis_threshold_candidates must be a list of positive floats.")
+    vals = sorted({float(v) for v in raw if float(v) > 0.0})
+    if not vals:
+        raise ValueError("vis_threshold_candidates must contain at least one positive value.")
+    return vals
+
+
+def _calibrate_class_threshold(
+    preds: np.ndarray,
+    gts: np.ndarray,
+    candidates: list[float],
+) -> tuple[float, dict[str, float]]:
+    """
+    Pick threshold that balances overlap quality and area calibration.
+    """
+    gt_fg = np.abs(gts) > 0
+    gt_area = np.maximum(gt_fg.sum(axis=(1, 2)).astype(np.float64), 1.0)
+
+    best_thr = float(candidates[0])
+    best_stats: dict[str, float] = {}
+    best_score = -float("inf")
+
+    for thr in candidates:
+        pred_cls = _to_three_class(preds, thr=thr)
+        pred_fg = pred_cls != 0
+        pred_area = pred_fg.sum(axis=(1, 2)).astype(np.float64)
+
+        inter = np.logical_and(pred_fg, gt_fg).sum(axis=(1, 2)).astype(np.float64)
+        union = np.logical_or(pred_fg, gt_fg).sum(axis=(1, 2)).astype(np.float64)
+        iou = inter / np.maximum(union, 1.0)
+        area_ratio = pred_area / gt_area
+
+        mean_iou = float(iou.mean())
+        mean_area_ratio = float(area_ratio.mean())
+        median_area_ratio = float(np.median(area_ratio))
+        area_penalty = abs(math.log(max(mean_area_ratio, 1e-8)))
+        score = mean_iou - 0.20 * area_penalty
+
+        if score > best_score:
+            best_score = score
+            best_thr = float(thr)
+            best_stats = {
+                "mean_iou": mean_iou,
+                "mean_area_ratio": mean_area_ratio,
+                "median_area_ratio": median_area_ratio,
+                "score": float(score),
+            }
+
+    return best_thr, best_stats
 
 
 def _centroid_mm(
@@ -241,6 +301,9 @@ def main() -> None:
     gauss_sigma = float(cfg.get("vis_gaussian_sigma", _DEFAULT_GAUSS_SIGMA))
     cls_thresh = float(cfg.get("vis_class_threshold", _DEFAULT_CLS_THRESH))
     upsample = int(cfg.get("vis_upsample", _DEFAULT_UPSAMPLE))
+    auto_thresh = bool(cfg.get("vis_auto_threshold", _DEFAULT_AUTO_THRESH))
+    thr_candidates = _resolve_threshold_candidates(cfg)
+    thr_calib_samples = int(cfg.get("vis_threshold_calib_samples", _DEFAULT_THR_CALIB_SAMPLES))
 
     # ── Resolve checkpoint path (CLI > config > newest in checkpoint_dir) ─────
     if args.model is not None:
@@ -275,7 +338,8 @@ def main() -> None:
           f"model={ckpt.get('model_name', cfg.get('model_name', 'unknown'))}")
 
     # ── Reload test split (deterministic – identical seeds to train.py) ────────
-    _, _, test_loader, test_ds = get_dataloaders(cfg)
+    _, val_loader, test_loader, test_ds = get_dataloaders(cfg)
+    val_ds = val_loader.dataset
 
     # ── Full test-set MSE / RMSE ───────────────────────────────────────────────
     criterion = nn.MSELoss()
@@ -291,6 +355,31 @@ def main() -> None:
     test_rmse = math.sqrt(test_mse)
     print(f"[test] Final Test MSE  = {test_mse:.6f}")
     print(f"[test] Final Test RMSE = {test_rmse:.6f}")
+
+    threshold_stats = None
+    if auto_thresh:
+        n_calib = min(max(int(thr_calib_samples), 1), len(val_ds))
+        calib_idxs = np.arange(n_calib, dtype=np.int64)
+        x_calib = torch.from_numpy(val_ds.delta_v[calib_idxs]).to(device)
+        with torch.no_grad():
+            preds_calib = model(x_calib).squeeze(1).cpu().numpy()
+        gts_calib = val_ds.masks[calib_idxs, 0]
+        if gauss_sigma > 0.0:
+            preds_calib = np.stack(
+                [gaussian_filter(pred, sigma=gauss_sigma) for pred in preds_calib],
+                axis=0,
+            )
+        cls_thresh, threshold_stats = _calibrate_class_threshold(
+            preds=preds_calib,
+            gts=gts_calib,
+            candidates=thr_candidates,
+        )
+        print(
+            "[test] Auto-threshold selected "
+            f"{cls_thresh:.3f} using {n_calib} val samples "
+            f"(mean IoU={threshold_stats['mean_iou']:.4f}, "
+            f"mean area ratio={threshold_stats['mean_area_ratio']:.3f})"
+        )
 
     # ── Sample selection ───────────────────────────────────────────────────────
     requested_n = args.n_samples if args.n_samples is not None else int(cfg.get("default_test_samples", 5))
@@ -420,6 +509,10 @@ def main() -> None:
         "test_checkpoint_path": cfg.get("test_checkpoint_path"),
         "vis_gaussian_sigma": cfg.get("vis_gaussian_sigma"),
         "vis_class_threshold": cfg.get("vis_class_threshold"),
+        "vis_auto_threshold": cfg.get("vis_auto_threshold"),
+        "vis_threshold_candidates": cfg.get("vis_threshold_candidates"),
+        "vis_threshold_calib_samples": cfg.get("vis_threshold_calib_samples"),
+        "vis_selected_threshold": cls_thresh,
         "vis_upsample": cfg.get("vis_upsample"),
     }
     log_record = {
@@ -442,6 +535,7 @@ def main() -> None:
             "loc_err_median_mm": loc_median,
             "loc_err_p90_mm": loc_p90,
         },
+        "threshold_calibration": threshold_stats,
     }
     log_path = _resolve_log_path(cfg)
     _append_jsonl(log_path, log_record)

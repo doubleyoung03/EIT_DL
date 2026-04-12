@@ -142,8 +142,11 @@ test_seed: 42              # seed used by test.py when --seed is not passed
 deterministic: true        # stricter reproducibility; can reduce speed
 
 # ── Visualisation (test.py) ───────────────────────────────────────────────────
-vis_gaussian_sigma: 1.0
-vis_class_threshold: 0.1
+vis_gaussian_sigma: 0.35
+vis_class_threshold: 0.25
+vis_auto_threshold: true
+vis_threshold_candidates: [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
+vis_threshold_calib_samples: 256
 vis_upsample: 4
 default_test_samples: 5
 test_checkpoint_path: null   # e.g. checkpoints/best_model_64x64_20260101_0900.pth

@@ -28,3 +28,30 @@ degrades reconstruction quality.
 - Linter: no errors introduced in any modified file.
 - Input dimension remains 224; no model architecture change required.
 - Existing checkpoints are incompatible with the new processing and require retraining.
+
+## 2026-04-12 — Add Auto Threshold Calibration For Test Visualisation
+
+### What changed
+Improved test-time post-processing to reduce systematic anomaly over-segmentation.
+`test.py` now supports automatic threshold calibration using the validation split:
+it searches candidate `vis_class_threshold` values and selects the one that best
+balances overlap quality (IoU) and predicted-vs-ground-truth area ratio.
+Test logging now records the selected threshold and calibration statistics.
+Visualization defaults were also tightened to reduce boundary dilation.
+
+### Why
+Predicted anomaly shapes were consistently larger than ground truth on testing.
+The main contributors were low fixed thresholding and strong Gaussian smoothing.
+Auto-calibration makes thresholding data-driven per model/checkpoint, reducing
+manual trial-and-error and improving shape-size consistency.
+
+### Files affected
+| File | Change |
+|------|--------|
+| `src/test.py` | Added threshold-candidate parsing, validation-based auto-threshold calibration, and logging fields for selected threshold and calibration stats. |
+| `config.yaml` | Updated visualisation defaults: lower smoothing (`vis_gaussian_sigma`), higher base threshold (`vis_class_threshold`), and enabled threshold auto-calibration with candidate list/sample count. |
+
+### Validation
+- Linter: no errors introduced in modified files.
+- Syntax check: `python -m py_compile src/test.py src/train.py src/dataset.py` passed.
+- Runtime note: `python src/test.py` currently cannot complete because no `.pth` checkpoint exists in `checkpoints/`.
