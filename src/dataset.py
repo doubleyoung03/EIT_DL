@@ -74,6 +74,19 @@ def _build_valid_mask(n_el: int = 16) -> np.ndarray:
 
 _VALID_MASK = _build_valid_mask(16)   # (256,) bool, module-level cache
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Preprocessing constants — MUST stay in sync with Implementation/inference.py
+# ──────────────────────────────────────────────────────────────────────────────
+# 2026-04-17: training now matches inference byte-for-byte on the
+# differential-normalisation step.  Previously the floor/clip were applied
+# only at inference, producing a fragile StandardScaler whose near-neutral
+# channels amplified any sim↔hw mismatch into z-scores of 10^4–10^5 and
+# collapsed the Transformer output to a position-insensitive blob.
+# Applying the same floor + clip during training fits the scaler on the
+# SAME distribution the model sees at inference, eliminating the OOD gap.
+_REF_ABS_FLOOR = 5e-5    # 50 µV — neutral-channel clamp
+_DV_CLIP       = 700.0   # empirical upper bound of (v−ref)/|ref| at runtime
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DataLoader seed helper
@@ -167,8 +180,17 @@ class EITDataset(Dataset):
 
         # ── Differential normalization w.r.t. homogeneous reference ───────────
         #    dv_norm = (V_measured - V_ref) / |V_ref|
+        # Numerics MUST match Implementation/inference.py::preprocess:
+        #   1) floor |V_ref| below _REF_ABS_FLOOR  →  set that channel's dv = 0
+        #   2) clip dv to ±_DV_CLIP as a safety net
+        # See module-level comment above for the rationale.
         ref = v_ref_224[None, :]                           # (1, 224) broadcast
-        dv_224 = (v_224 - ref) / np.abs(ref)               # (N, 224)
+        ref_abs = np.abs(ref)
+        neutral_col = (ref_abs < _REF_ABS_FLOOR).ravel()   # (224,) bool
+        ref_abs_safe = np.where(neutral_col[None, :], 1.0, ref_abs)
+        dv_224 = (v_224 - ref) / ref_abs_safe               # (N, 224)
+        dv_224[:, neutral_col] = 0.0
+        np.clip(dv_224, -_DV_CLIP, _DV_CLIP, out=dv_224)
 
         # ── StandardScaler ────────────────────────────────────────────────────
         if scaler is None:

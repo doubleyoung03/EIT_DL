@@ -1,5 +1,68 @@
 # Changelog
 
+## 2026-04-17 — Match dataset preprocessing with inference (floor + dv clip)
+
+### What changed
+`src/dataset.py::EITDataset.__init__` now applies the SAME numerical
+safeguards as `D:\Yang\EIT\Implementation\inference.py::preprocess` on the
+differential-normalisation step:
+
+1. Channels with `|V_ref| < _REF_ABS_FLOOR = 5e-5 V` (≈ the electrical
+   neutral line) are treated as neutral — their `dv` row entries are set
+   to `0.0` instead of the unstable `(v − v_ref) / |v_ref|`.
+2. The resulting `dv` tensor is clipped to `±_DV_CLIP = 700.0` before
+   being handed to `StandardScaler`.
+
+Two module-level constants `_REF_ABS_FLOOR` and `_DV_CLIP` were added with
+explicit documentation that they must stay in sync with
+`Implementation/inference.py`.
+
+### Why
+Live validation with `pipeline_diagnostic.py` on the deployed
+`transformer_decoder_large` checkpoint (epoch 193, val MSE 0.002645)
+exposed a train↔inference mismatch:
+
+- Training (old dataset.py): `dv = (v − v_ref) / |v_ref|` — **no floor,
+  no clip**. Near-neutral channels ended up with dv values of 10^4–10^6
+  magnitude, on which the `StandardScaler` fitted a degenerate statistics
+  pair (tiny σ, large μ).
+- Inference: floored & clipped — produced `dv ≈ 0` on those same
+  channels, which the scaler then mapped to z-scores of −10^2..−10^4.
+
+Symptoms observed in the GUI:
+- Empty tank reconstructed as a saturated blue blob (NN output = −1.0).
+- Moving the insulating bottle did not change the reconstruction —
+  spatial information was drowned under the ~10^2× OOD offset.
+- `pipeline_diagnostic` Stage 4 with floor = 5e-5 reported
+  `|scaled|_max = 164`; with floor = 1e-12 it jumped to
+  `|scaled|_max = 40495`, confirming the scaler was the fragile element.
+
+Applying floor + clip in `dataset.py` refits the scaler on the SAME
+distribution the model sees at inference, eliminating the OOD gap by
+construction.
+
+### Files affected
+| File | Change |
+|------|--------|
+| `src/dataset.py` | Added `_REF_ABS_FLOOR`, `_DV_CLIP` constants; extended `EITDataset.__init__` to floor + zero neutral-channel dv and to clip dv before scaler fit. |
+| `CHANGELOG.md` | This entry. |
+
+### Retrain required
+Yes. Existing checkpoints pre-date this change and are therefore coupled
+to the unstable scaler; retrain from scratch against the 200-mm, 16 000-
+sample dataset (`eit_dataset.csv`) before redeploying. Inference-side
+band-aid (`_SCALED_CLIP = ±5` in `Implementation/inference.py`) keeps the
+old checkpoint usable in the meantime.
+
+### Validation
+- Static: `ReadLints` clean.
+- Required follow-up (Young): set `config.yaml::data_dir` to the folder
+  containing the 16 000-sample CSV and `tank_radius: 100.0`, then
+  `python src/train.py`. After training, `pipeline_diagnostic` Stage 4
+  should report `|scaled|_max < 10` by construction.
+
+---
+
 ## 2026-04-12 — Add Reference Voltage Differential Processing
 
 ### What changed
