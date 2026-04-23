@@ -254,6 +254,13 @@ def main() -> None:
                     "scaler_mean":  test_ds.scaler.mean_,
                     "scaler_std":   test_ds.scaler.scale_,
                     "reference_voltage_csv": cfg.get("reference_voltage_csv"),
+                    # Adjacent-diff preprocessing metadata (see dataset.py).
+                    # Persisted so inference reproduces the exact training
+                    # pipeline: 208-channel dV_ref, adaptive floor, and
+                    # neutral-channel mask.
+                    "adj_floor":         float(test_ds.adj_floor),
+                    "adj_neutral_mask":  test_ds.adj_neutral_mask,
+                    "dv_ref":            test_ds.dv_ref,
                 },
                 best_path,
             )

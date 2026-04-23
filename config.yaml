@@ -3,9 +3,9 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Network I/O ───────────────────────────────────────────────────────────────
-input_dim: 224         # 16 drives x 14 measures (32 self-measurements removed)
+input_dim: 208         # 16 drives x 13 adjacent-pair measurements (injection pairs excluded)
 image_size: 64         # output = 64x64
-tank_radius: 50.0      # tank radius [mm]
+tank_radius: 100.0      # tank radius [mm]
 
 # ── Active model (switch here) ───────────────────────────────────────────────
 # Supported model_name:
@@ -118,10 +118,10 @@ model:
 #   decoder_channels: [512, 256, 128, 64]
 #   decoder_dropout: 0.15
 
-# ── Dataset (CSV produced externally by COMSOL) ──────────────────────────────
+# ── Dataset (adjacent-diff CSV produced by COMSOL4EIT/convert_singleend_to_adjacent.py) ──
 data_dir: data
-csv_filename: eit_dataset.csv
-reference_voltage_csv: reference_voltages.csv   # homogeneous-medium baseline
+csv_filename: eit_dataset_adj.csv               # 208 dV_src*_p*p* columns + 6 metadata
+reference_voltage_csv: reference_voltages_adj.csv  # homogeneous-medium baseline, 208 cols
 
 # ── Training / regularisation ────────────────────────────────────────────────
 lr: 1.0e-3

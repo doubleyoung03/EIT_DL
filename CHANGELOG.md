@@ -1,5 +1,157 @@
 # Changelog
 
+## 2026-04-22 — Switch to 208-channel Adjacent-Pair Differential Input
+
+### What changed
+
+The training pipeline moves from 224 single-ended voltages to the
+literature-standard 208 adjacent-pair differentials (16 injections x
+13 valid pairs per injection, injection electrodes and their
+immediate neighbours excluded).
+
+Physical rationale (written out fully in
+`D:\Yang\EIT\COMSOL4EIT\CHANGELOG.md` under the same date): adjacent
+differentiation cancels common-mode interference and the symmetric
+part of contact-impedance mismatch at the front end, giving the
+network a much cleaner input *before* the existing
+`(dV_sample − dV_ref) / |dV_ref|` normalisation is applied.
+
+### Files touched
+
+* **NEW** `src/adjacent_diff.py` — byte-identical copy of the shared
+  utility living in COMSOL4EIT and Implementation.  Provides
+  `ADJ_VALID_MASK_2D`, `singleend_to_adj_208`, `adj_column_names` and
+  `compute_adj_ref_floor`.
+
+* **REWRITTEN** `src/dataset.py`
+    * Consumes 208-column `dV_src*_p*p*` CSVs directly (the output of
+      `convert_singleend_to_adjacent.py`); raises a clear error if
+      pointed at a legacy 256-column CSV.
+    * Replaces the fixed `_REF_ABS_FLOOR=5e-5` with an adaptive floor
+      computed from the reference distribution (`compute_adj_ref_floor`,
+      percentile=1.0, absolute minimum 1 nV).  Neutral-mask count
+      drops from 67/224 (30%) in the old single-ended space to ~3/208
+      in adjacent-diff space, because the latter has a much narrower
+      dynamic range.
+    * Exposes `adj_floor`, `adj_neutral_mask`, `dv_ref` on the dataset
+      object so `train.py` can serialise them into the checkpoint for
+      deterministic inference.
+
+* **MODIFIED** `config.yaml`
+    * `input_dim: 224 -> 208`
+    * `csv_filename: eit_dataset.csv -> eit_dataset_adj.csv`
+    * `reference_voltage_csv: reference_voltages.csv
+       -> reference_voltages_adj.csv`
+
+* **MODIFIED** `src/train.py`
+    * Checkpoint now stores `adj_floor`, `adj_neutral_mask`, `dv_ref`
+      alongside the existing `scaler_mean / scaler_std`, so the
+      inference pipeline can reproduce the training preprocessing
+      without re-reading the reference CSV.
+
+* **UNTOUCHED** `src/model.py` — reads `input_dim` from the config
+  (verified: all five reconstructor classes accept `input_dim` as a
+  constructor argument and use it consistently through the first
+  linear/token layer).  The transformer's positional embedding
+  `nn.Parameter(torch.zeros(1, input_dim, token_dim))` scales with
+  `input_dim` automatically.
+
+### Data
+
+* `data/eit_dataset_adj.csv` (4 740 rows x 214 cols) and
+  `data/reference_voltages_adj.csv` (1 row x 208) are produced by
+  running
+  `python D:\Yang\EIT\COMSOL4EIT\convert_singleend_to_adjacent.py
+   --dataset D:\Yang\EIT\Network\data\eit_dataset.csv --overwrite`.
+  The original single-ended CSVs remain on disk as historical
+  artefacts.
+
+### Checkpoint compatibility
+
+**All pre-2026-04-22 checkpoints in `checkpoints/` are invalidated.**
+Their first linear layer expects 224 inputs; loading one against the
+new 208-dim config will fail with a shape-mismatch error.  Retraining
+is required:
+
+```
+python src\train.py
+```
+
+The old `.pth` files are preserved untouched so historical loss
+curves and scaler statistics remain inspectable.
+
+### Smoke validation
+
+```
+[dataset] Reference loaded: .../reference_voltages_adj.csv
+          (|dV_ref| median=1.801e-05 V, p1 floor=1.235e-05 V,
+           neutral=3/208)
+[dataset] 4740 samples detected, 214 columns.
+[dataset] Split -> train=3412  val=380  test=948
+input shape: torch.Size([4, 208]) dtype: torch.float32
+scaled |z| max/mean: 3.78 / 0.59
+```
+
+The max post-scaler `|z|` of 3.78 comfortably sits inside the ±5
+clip, which was a saturating problem under the old single-ended
+pipeline — confirming the dynamic-range benefit expected from
+adjacent differentiation.
+
+---
+
+## 2026-04-22 — Note on inference-side switch to true HW-native diff imaging
+
+### What changed
+
+**No source changes in this repository.** This entry is a forward-
+pointer to document the sim-to-real fix implemented in the companion
+repo (`D:\Yang\EIT\COMSOL4EIT` and `D:\Yang\EIT\Implementation`), which
+materially affects how the *trained* Transformer checkpoint is
+used at inference.
+
+### Why
+
+Live testing on STM32 hardware revealed that the legacy inference
+pipeline was subtracting `V_sim_ref` (after an affine projection of
+the HW frame onto COMSOL space), not `V_hw_ref`. Training-side
+preprocessing has always been
+`dv = (V_sim_sample − V_sim_ref) / |V_sim_ref|`, which is a valid
+normalised time-difference representation — but the HW-side path was
+NOT true time-difference, so hardware systematics (contact impedance,
+DC bias, injection-current error) were leaking into `dv` and dominating
+the anomaly signal.
+
+### Inference-side fix (details in COMSOL4EIT/CHANGELOG.md 2026-04-22)
+
+`Implementation/inference.py` now defaults to `mode="hw_native"` when
+`set_hardware_reference()` is called, i.e.:
+```
+dv_hw = (V_hw_sample − V_hw_ref) / |V_hw_ref|
+```
+The same training-time neutral mask (67/224 channels where
+`|V_sim_ref| < 5e-5 V`) is applied so the scaler input keeps the
+sparsity pattern the model was trained on. The legacy
+`mode="affine"` path is preserved for A/B comparison.
+
+### Implications for this repo
+
+- **No retraining is required for Phase 1** — the existing checkpoint
+  is reused as-is. If Phase 1 recovers spatial reconstruction but with
+  incorrect magnitudes, Phase 2 (re-fit `scaler_mean` / `scaler_std`
+  on HW uniform frames) or Phase 3 (retrain with domain randomisation
+  of `z_c`, `σ_bg`, electrode positions, multiplicative noise,
+  rotational augmentation) becomes the next action.
+- `src/dataset.py`'s `_REF_ABS_FLOOR=5e-5` and `_DV_CLIP=700.0` must
+  stay in sync with `Implementation/inference.py`; the matching
+  constants there are unchanged.
+
+### Validation
+
+Pending live hardware test by Young. Offline validator:
+`D:\Yang\EIT\COMSOL4EIT\diff_imaging_probe.py`.
+
+---
+
 ## 2026-04-17 — Match dataset preprocessing with inference (floor + dv clip)
 
 ### What changed

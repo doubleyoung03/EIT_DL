@@ -1,42 +1,53 @@
 """
-EIT Dataset – Polarised Anomalies, 64x64 High-Resolution Output.
+EIT Dataset — Adjacent-Differential Representation (208 channels)
+==================================================================
 
-Expected CSV schema  (one row = one sample, 262 columns total)
-──────────────────────────────────────────────────────────────
-Col  0   sample_id    – integer sample index
-Col  1   x0_mm        – anomaly centre x  [mm]
-Col  2   y0_mm        – anomaly centre y  [mm]
-Col  3   r_mm         – anomaly radius    [mm]
-Col  4   sigma_touch  – anomaly conductivity [S/m]
-             ~50    -> conductive -> target pixel value = +1.0
-             ~1e-9  -> resistive  -> target pixel value = -1.0
-Col  5   sample_valid – validity flag (1 = valid)
-Cols 6–261  V_srcXX_snkYY_chZZ – 16 drive pairs × 16 measurement channels
-            (drive-major order, channels 01–16 per drive pair)
+Reads the 208-column adjacent-pair differential CSV produced by
+``D:\\Yang\\EIT\\COMSOL4EIT\\convert_singleend_to_adjacent.py`` and feeds
+normalised time-difference inputs to the reconstruction network.
 
-Reference voltage CSV  (one row, 256 V_src columns)
-────────────────────────────────────────────────────
-Homogeneous-medium baseline measured/simulated without any anomaly.
-Used to compute the differential normalised input:
-    dv_norm = (V_measured - V_ref) / |V_ref|
+Expected CSV schema
+-------------------
+Metadata columns (in any order, prefix-free):
+    sample_id, x0_mm, y0_mm, r_mm, sigma_touch, sample_valid
 
-The CSV is produced externally (e.g. by COMSOL) and must exist at the path
-specified by  data_dir / csv_filename  in config.yaml before training starts.
-No synthetic data generation is performed here.
+Voltage columns (exactly 208, prefix ``dV_src``):
+    dV_src01_snk02_p03p04 … dV_src16_snk01_p14p15
 
-Self-measurement mask
-─────────────────────
-In the 16x16 adjacency matrix (row = drive k, col = measure m):
-  invalid when  m == k  OR  m == (k+1) % 16   (shared electrode)
-16 drives x 2 invalid each = 32 masked entries  ->  224 valid measurements.
+    Each column is a single adjacent-pair differential voltage in volts:
 
-Splitting  (sklearn.model_selection.train_test_split)
-─────────────────────────────────────────────────────
+        dV[inj, k] = V[inj, (k+1) mod 16] − V[inj, k]
+
+    with injections that touch either electrode of the pair excluded
+    (16 injections × 13 valid pairs = 208 measurements).
+
+Reference voltage CSV
+---------------------
+One row, same 208 ``dV_src*_p*p*`` columns, measured/simulated on a
+homogeneous background without any anomaly.  Used for the standard
+normalised time-difference input:
+
+    dv_norm = (dV_measured − dV_ref) / |dV_ref|
+
+See ``adjacent_diff.py`` for the physics / mask derivation.
+
+Neutral-channel floor
+---------------------
+Adjacent-diff magnitudes span several decades across the tank cross
+section.  Channels whose reference |dV_ref| is below an adaptive floor
+(default p1 of the reference distribution, with an absolute minimum of
+1 nV) are treated as "neutral" and forced to zero in dv_norm to avoid
+dividing by near-zero values.  Both the floor and the resulting neutral
+mask are stored on the dataset and on the checkpoint so that the
+inference-time preprocessing hits the exact same set of channels.
+
+Splitting (sklearn.model_selection.train_test_split)
+----------------------------------------------------
 get_dataloaders() does:
-  Step 1 – 80 / 20  ->  train_val_idx  /  test_idx     (random_state=42)
-  Step 2 – 90 / 10  ->  train_idx      /  val_idx      (within train_val)
+  Step 1 — 80 / 20  ->  train_val_idx  /  test_idx     (random_state=42)
+  Step 2 — 90 / 10  ->  train_idx      /  val_idx      (within train_val)
   Totals: ~72% train | ~8% val | 20% test
-Dataset size is determined dynamically from len(dataframe) – never hardcoded.
+Dataset size is determined dynamically from len(dataframe) — never hardcoded.
 Three assert statements verify ZERO index overlap across all splits.
 StandardScaler is fitted EXCLUSIVELY on the training indices.
 """
@@ -53,39 +64,21 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 
+from adjacent_diff import (
+    N_VALID,
+    adj_column_names,
+    compute_adj_ref_floor,
+)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Self-measurement boolean mask  (computed once at module load)
+# Preprocessing constants
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _build_valid_mask(n_el: int = 16) -> np.ndarray:
-    """
-    Return a flat boolean array of length n_el^2.
-    True  => valid  adjacent-adjacent measurement.
-    False => self-measurement  (m == k  or  m == (k+1) % n_el).
-    Result for n_el=16: 16 * (16-2) = 224 True entries out of 256.
-    """
-    mask = np.ones((n_el, n_el), dtype=bool)
-    for k in range(n_el):
-        mask[k, k]               = False   # drive pair == measure pair
-        mask[k, (k + 1) % n_el] = False   # measure pair shares sink electrode
-    return mask.ravel()
-
-
-_VALID_MASK = _build_valid_mask(16)   # (256,) bool, module-level cache
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Preprocessing constants — MUST stay in sync with Implementation/inference.py
-# ──────────────────────────────────────────────────────────────────────────────
-# 2026-04-17: training now matches inference byte-for-byte on the
-# differential-normalisation step.  Previously the floor/clip were applied
-# only at inference, producing a fragile StandardScaler whose near-neutral
-# channels amplified any sim↔hw mismatch into z-scores of 10^4–10^5 and
-# collapsed the Transformer output to a position-insensitive blob.
-# Applying the same floor + clip during training fits the scaler on the
-# SAME distribution the model sees at inference, eliminating the OOD gap.
-_REF_ABS_FLOOR = 5e-5    # 50 µV — neutral-channel clamp
-_DV_CLIP       = 700.0   # empirical upper bound of (v−ref)/|ref| at runtime
+# MUST stay in sync with Implementation/inference.py and the probe script in
+# COMSOL4EIT/diff_imaging_probe.py.  See each repo's 2026-04-22 CHANGELOG.
+_ADJ_FLOOR_PERCENTILE: float = 1.0   # |dV_ref| percentile -> neutral threshold
+_ADJ_FLOOR_ABS_MIN: float    = 1e-9  # volts, hard lower bound for the floor
+_DV_CLIP: float              = 700.0 # empirical safety clip on dv_norm
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -93,40 +86,63 @@ _DV_CLIP       = 700.0   # empirical upper bound of (v−ref)/|ref| at runtime
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _seed_worker(worker_id: int) -> None:
-    """
-    Keep numpy/python RNG deterministic per worker.
-    Useful when num_workers > 0.
-    """
+    """Keep numpy/python RNG deterministic per worker (num_workers > 0)."""
     seed = torch.initial_seed() % (2**32)
     np.random.seed(seed)
     random.seed(seed)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pixel-grid builder  (shared by EITDataset and test.py)
+# Pixel-grid builder (shared with test.py)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_pixel_grid(
     image_size: int,
     tank_radius: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Build spatial coordinate arrays for the square pixel grid.
+    """Spatial coordinates + tank mask for the square pixel grid.
 
-    Pixel centres span (-tank_radius, +tank_radius) mm in both x and y.
-    Row 0 = highest y value (top of image), matching standard image orientation.
+    Row 0 is the highest y value (standard image orientation).
 
     Returns
     -------
     xx, yy    : float64 arrays of shape (image_size, image_size)
     tank_mask : bool    array  of shape (image_size, image_size)
-                        True for pixels whose centre lies inside the tank circle.
+                True for pixel centres inside the tank circle.
     """
-    n      = image_size
-    R      = tank_radius
+    n = image_size
+    R = tank_radius
     coords = (np.arange(n) + 0.5) * (2.0 * R / n) - R
     xx, yy = np.meshgrid(coords, coords[::-1])
     return xx, yy, (xx**2 + yy**2) <= R**2
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CSV column-detection helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+_EXPECTED_ADJ_COLS: list[str] = adj_column_names()
+
+
+def _extract_dv_columns(df: pd.DataFrame, source_tag: str) -> list[str]:
+    """Return the 208 ``dV_src*_p*p*`` column names in canonical order.
+
+    Raises if the count is not exactly 208 or if any canonical name is
+    missing from ``df``.
+    """
+    dv_cols = [c for c in df.columns if c.startswith("dV_src")]
+    if len(dv_cols) != N_VALID:
+        raise ValueError(
+            f"[{source_tag}] expected {N_VALID} dV_src columns, found {len(dv_cols)}. "
+            "Did you run `convert_singleend_to_adjacent.py` on the CSV?"
+        )
+    missing = [c for c in _EXPECTED_ADJ_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"[{source_tag}] CSV is missing {len(missing)} canonical dV columns; "
+            f"first missing: {missing[0]!r}"
+        )
+    return _EXPECTED_ADJ_COLS
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -135,32 +151,35 @@ def build_pixel_grid(
 
 class EITDataset(Dataset):
     """
-    Wraps a pandas DataFrame slice and exposes (v_meas, mask) tensor pairs.
+    Exposes (dv_scaled, mask) tensor pairs on a dataframe slice.
 
     Processing pipeline
-    ───────────────────
-    1. v_raw    = raw voltages from V_srcXX_snkYY_chZZ columns  shape (N, 256)
-    2. Apply _VALID_MASK  ->  v_224                              shape (N, 224)
-    3. Differential normalization:
-         dv = (v_224 - v_ref) / |v_ref|                         shape (N, 224)
-    4. StandardScaler (fitted on training split only)            shape (N, 224)
-    5. Build 64x64 target mask from geometry + sigma_touch:
-         inside anomaly AND inside tank circle: +1.0 (conductive) or -1.0 (resistive)
-         all other pixels                     :  0.0
+    -------------------
+    1. dv_raw    = (N, 208) adjacent-diff voltages pulled from 208 dV columns
+    2. dv_norm   = (dv_raw − dv_ref) / |dv_ref|, with adaptive floor
+    3. neutral-channel zeroing + |dv| clipping to ±_DV_CLIP
+    4. StandardScaler (fitted on the training split only)
+    5. 64×64 target mask from (x0, y0, r, sigma_touch) + tank geometry:
+         inside anomaly AND inside tank circle: +1 (conductive) or −1 (resistive)
+         all other pixels                     :  0
 
     Parameters
     ----------
-    df        : pandas DataFrame – a contiguous row-slice of the full CSV.
-    config    : dict with keys: image_size, tank_radius.
-    v_ref_224 : (224,) float32 array – masked homogeneous-medium reference voltages.
-    scaler    : pre-fitted StandardScaler, or None to fit on this split.
+    df              : pandas DataFrame — a contiguous row-slice of the CSV.
+    config          : dict with keys ``image_size`` and ``tank_radius``.
+    dv_ref_208      : (208,) float64 array — masked homogeneous-medium reference.
+    neutral_mask_208: (208,) bool   array — True for channels to zero.
+    floor           : float          — adaptive |dV_ref| floor (volts).
+    scaler          : pre-fitted StandardScaler, or None to fit on this split.
     """
 
     def __init__(
         self,
         df: pd.DataFrame,
         config: dict,
-        v_ref_224: np.ndarray,
+        dv_ref_208: np.ndarray,
+        neutral_mask_208: np.ndarray,
+        floor: float,
         scaler: StandardScaler | None = None,
     ) -> None:
         img_sz = int(config["image_size"])
@@ -168,69 +187,56 @@ class EITDataset(Dataset):
 
         xx, yy, tank_mask = build_pixel_grid(img_sz, R)
 
-        # ── Voltage measurements: 256 raw  ->  224 valid ─────────────────────
-        v_cols = [c for c in df.columns if c.startswith("V_src")]
-        if len(v_cols) != 256:
-            raise ValueError(
-                f"Expected 256 voltage columns (V_src...), found {len(v_cols)}. "
-                "Check CSV column names."
-            )
-        v_raw  = df[v_cols].values.astype(np.float32)      # (N, 256)
-        v_224  = v_raw[:, _VALID_MASK]                     # (N, 224)
+        # ── Pull dV columns in canonical order ───────────────────────────────
+        dv_cols = _extract_dv_columns(df, source_tag="dataset")
+        dv_raw = df[dv_cols].values.astype(np.float64)     # (N, 208)
 
-        # ── Differential normalization w.r.t. homogeneous reference ───────────
-        #    dv_norm = (V_measured - V_ref) / |V_ref|
-        # Numerics MUST match Implementation/inference.py::preprocess:
-        #   1) floor |V_ref| below _REF_ABS_FLOOR  →  set that channel's dv = 0
-        #   2) clip dv to ±_DV_CLIP as a safety net
-        # See module-level comment above for the rationale.
-        ref = v_ref_224[None, :]                           # (1, 224) broadcast
-        ref_abs = np.abs(ref)
-        neutral_col = (ref_abs < _REF_ABS_FLOOR).ravel()   # (224,) bool
-        ref_abs_safe = np.where(neutral_col[None, :], 1.0, ref_abs)
-        dv_224 = (v_224 - ref) / ref_abs_safe               # (N, 224)
-        dv_224[:, neutral_col] = 0.0
-        np.clip(dv_224, -_DV_CLIP, _DV_CLIP, out=dv_224)
+        # ── Normalised time-difference: dv_norm = (dV − dV_ref) / |dV_ref| ───
+        ref_abs = np.abs(dv_ref_208)
+        zero_cols = neutral_mask_208 | (ref_abs < floor)
+        ref_abs_safe = np.where(zero_cols, 1.0, ref_abs)
+        dv_norm = (dv_raw - dv_ref_208[None, :]) / ref_abs_safe[None, :]
+        dv_norm[:, zero_cols] = 0.0
+        np.clip(dv_norm, -_DV_CLIP, _DV_CLIP, out=dv_norm)
 
-        # ── StandardScaler ────────────────────────────────────────────────────
+        # ── StandardScaler (fit on first construction, reuse thereafter) ─────
         if scaler is None:
             scaler = StandardScaler()
-            scaler.fit(dv_224)
+            scaler.fit(dv_norm)
         self.scaler = scaler
-        dv_scaled   = scaler.transform(dv_224).astype(np.float32)
+        dv_scaled = scaler.transform(dv_norm).astype(np.float32)
 
-        # ── Target masks  (image_size x image_size) ───────────────────────────
+        # ── Target masks (image_size × image_size) ───────────────────────────
         x0_a  = df["x0_mm"].values
         y0_a  = df["y0_mm"].values
         r_a   = df["r_mm"].values
-        sig_a = df["sigma_touch"].values           # column index 4
+        sig_a = df["sigma_touch"].values
 
-        # Polarity: +1.0 if conductive (~50 S/m), -1.0 if resistive (~1e-9 S/m)
-        tgt   = np.where(np.abs(sig_a - 50.0) < 1.0, 1.0, -1.0).astype(np.float32)
+        tgt = np.where(np.abs(sig_a - 50.0) < 1.0, 1.0, -1.0).astype(np.float32)
 
-        # Vectorised mask construction over all N samples
-        N     = len(df)                            # dynamic – never hardcoded
-        xx_f  = xx.ravel()[None, :]                # (1, img_sz^2)
+        N = len(df)
+        xx_f  = xx.ravel()[None, :]
         yy_f  = yy.ravel()[None, :]
         dist2 = (xx_f - x0_a[:, None])**2 + (yy_f - y0_a[:, None])**2
         in_an = (dist2 <= r_a[:, None]**2) & tank_mask.ravel()[None, :]
-        pv    = (tgt[:, None] * in_an).astype(np.float32)   # (N, img_sz^2)
+        pv    = (tgt[:, None] * in_an).astype(np.float32)
 
-        self.delta_v = dv_scaled                   # (N, 224)
-        self.masks   = pv.reshape(N, 1, img_sz, img_sz)     # (N, 1, 64, 64)
+        self.delta_v = dv_scaled                                 # (N, 208)
+        self.masks   = pv.reshape(N, 1, img_sz, img_sz)          # (N, 1, H, W)
 
-        # Metadata kept for test.py visualisation
         self.x0       = x0_a
         self.y0       = y0_a
         self.r_anom   = r_a
-        self.polarity = tgt                        # (N,) float32: +1 or -1
+        self.polarity = tgt                                       # +1 or -1
 
     def __len__(self) -> int:
         return len(self.delta_v)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return (torch.from_numpy(self.delta_v[idx]),   # float32 (224,)
-                torch.from_numpy(self.masks[idx]))     # float32 (1, 64, 64)
+        return (
+            torch.from_numpy(self.delta_v[idx]),   # float32 (208,)
+            torch.from_numpy(self.masks[idx]),     # float32 (1, H, W)
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -241,59 +247,70 @@ def get_dataloaders(
     config: dict,
     csv_path: Path | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader, EITDataset]:
-    """
-    Build train / val / test DataLoaders from the COMSOL-generated EIT CSV.
+    """Build train / val / test DataLoaders from the adjacent-diff EIT CSV.
 
-    The CSV must already exist at  data_dir / csv_filename  (or at csv_path).
-    A FileNotFoundError is raised immediately if the file is missing.
-    Dataset size is determined dynamically from the number of rows in the CSV.
+    The CSV must already exist at ``data_dir / csv_filename`` (or at
+    ``csv_path``).  A FileNotFoundError is raised immediately if the file
+    is missing.  Dataset size is determined dynamically from the CSV.
 
     Splitting
-    ─────────
+    ---------
     Step 1: 80 / 20  ->  train_val_idx  /  test_idx
-    Step 2: 90 / 10  ->  train_idx      /  val_idx   (within train_val)
+    Step 2: 90 / 10  ->  train_idx      /  val_idx
 
-    Three assert statements guarantee zero index overlap between all splits.
-    StandardScaler is fitted exclusively on train_idx.
+    StandardScaler is fitted exclusively on the training split.
 
     Returns
-    ───────
+    -------
     train_loader, val_loader, test_loader, test_dataset
-    test_dataset is returned so test.py can access per-sample metadata.
+        ``test_dataset`` is returned so test.py can access per-sample
+        metadata (x0, y0, r, polarity) and the fitted scaler.  The floor
+        and neutral mask are exposed as attributes on the dataset object
+        for train.py to pack into the checkpoint.
     """
     if csv_path is None:
         csv_path = Path(config["data_dir"]) / config["csv_filename"]
 
-    # ── Require CSV to exist – no synthetic generation ────────────────────────
     if not csv_path.exists():
         raise FileNotFoundError(
-            f"EIT CSV not found: {csv_path}\n"
-            "Please place your COMSOL-exported CSV at that path before training."
+            f"EIT adjacency-diff CSV not found: {csv_path}\n"
+            "Produce it via "
+            "`python D:\\Yang\\EIT\\COMSOL4EIT\\convert_singleend_to_adjacent.py "
+            "--dataset <original_single_ended.csv>`."
         )
 
-    # ── Load reference voltages (homogeneous-medium baseline) ─────────────────
+    # ── Load reference voltages (homogeneous-medium baseline, 208 ch) ─────────
     ref_csv = config.get("reference_voltage_csv")
     if ref_csv is None:
         raise ValueError(
             "config must contain 'reference_voltage_csv' pointing to the "
-            "homogeneous-medium reference voltage file."
+            "homogeneous-medium adjacent-diff reference CSV."
         )
     ref_path = Path(config["data_dir"]) / ref_csv
     if not ref_path.exists():
         raise FileNotFoundError(
             f"Reference voltage CSV not found: {ref_path}\n"
-            "Please place your homogeneous-medium voltage CSV at that path."
+            "Produce it via `convert_singleend_to_adjacent.py` on the "
+            "single-ended reference file."
         )
-    ref_df = pd.read_csv(ref_path)
-    ref_v_cols = [c for c in ref_df.columns if c.startswith("V_src")]
-    if len(ref_v_cols) != 256:
-        raise ValueError(
-            f"Expected 256 voltage columns in reference CSV, found {len(ref_v_cols)}."
-        )
-    v_ref_224 = ref_df[ref_v_cols].values.astype(np.float32).ravel()[_VALID_MASK]
-    print(f"[dataset] Reference voltages loaded from {ref_path}  ({v_ref_224.shape[0]} channels)")
 
-    # ── Load  (size determined dynamically from the file) ─────────────────────
+    ref_df = pd.read_csv(ref_path)
+    ref_cols = _extract_dv_columns(ref_df, source_tag="reference")
+    dv_ref_208 = ref_df[ref_cols].values.astype(np.float64).ravel()
+    floor = compute_adj_ref_floor(
+        dv_ref_208,
+        percentile=_ADJ_FLOOR_PERCENTILE,
+        min_floor=_ADJ_FLOOR_ABS_MIN,
+    )
+    neutral_mask_208 = np.abs(dv_ref_208) < floor
+    print(
+        f"[dataset] Reference loaded: {ref_path}  "
+        f"(|dV_ref| median={np.median(np.abs(dv_ref_208)):.3e} V, "
+        f"p{_ADJ_FLOOR_PERCENTILE:g} floor={floor:.3e} V, "
+        f"neutral={int(neutral_mask_208.sum())}/{N_VALID})"
+    )
+
+    # ── Load dataset ──────────────────────────────────────────────────────────
     print(f"[dataset] Reading {csv_path} ...")
     df = pd.read_csv(csv_path)
     n_total = len(df)
@@ -306,12 +323,11 @@ def get_dataloaders(
         all_idx, test_size=0.20, random_state=42, shuffle=True
     )
 
-    # ── Step 2: 90 / 10  train / val  (within the 80%) ───────────────────────
+    # ── Step 2: 90 / 10  train / val (within the 80%) ────────────────────────
     tr_idx, va_idx = train_test_split(
         tv_idx, test_size=0.10, random_state=42, shuffle=True
     )
 
-    # ── Zero-overlap assertions ────────────────────────────────────────────────
     s_tr, s_va, s_te = set(tr_idx), set(va_idx), set(te_idx)
     assert s_tr & s_te == set(), "DATA LEAK: train / test index overlap!"
     assert s_va & s_te == set(), "DATA LEAK: val  / test index overlap!"
@@ -320,9 +336,25 @@ def get_dataloaders(
     print(f"[dataset] Split -> train={len(tr_idx)}  val={len(va_idx)}  test={len(te_idx)}")
 
     # ── Build datasets (scaler fitted on train split only) ────────────────────
-    train_ds = EITDataset(df.iloc[tr_idx].reset_index(drop=True), config, v_ref_224, scaler=None)
-    val_ds   = EITDataset(df.iloc[va_idx].reset_index(drop=True), config, v_ref_224, scaler=train_ds.scaler)
-    test_ds  = EITDataset(df.iloc[te_idx].reset_index(drop=True), config, v_ref_224, scaler=train_ds.scaler)
+    train_ds = EITDataset(
+        df.iloc[tr_idx].reset_index(drop=True), config,
+        dv_ref_208, neutral_mask_208, floor, scaler=None,
+    )
+    val_ds = EITDataset(
+        df.iloc[va_idx].reset_index(drop=True), config,
+        dv_ref_208, neutral_mask_208, floor, scaler=train_ds.scaler,
+    )
+    test_ds = EITDataset(
+        df.iloc[te_idx].reset_index(drop=True), config,
+        dv_ref_208, neutral_mask_208, floor, scaler=train_ds.scaler,
+    )
+
+    # Expose preprocessing metadata on the returned dataset (train.py packs
+    # these into the checkpoint so inference can reproduce byte-for-byte).
+    for ds in (train_ds, val_ds, test_ds):
+        ds.adj_floor = float(floor)
+        ds.adj_neutral_mask = neutral_mask_208.astype(np.bool_)
+        ds.dv_ref = dv_ref_208.astype(np.float64)
 
     bs  = int(config["batch_size"])
     pin = torch.cuda.is_available()
